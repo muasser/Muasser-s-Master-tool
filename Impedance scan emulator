@@ -1,0 +1,180 @@
+# === FRF demo: setup & parameters ===
+from math import pi
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+OUT_DIR = "results"          # all outputs will be written here
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# sampling & injection settings
+fs = 10_000.0                # sample rate [Hz]
+A  = 0.01                    # small-signal voltage injection amplitude [pu]
+freqs = [10.0, 25.0, 50.0, 120.0]  # test frequencies [Hz]
+cycles_per_freq = 20         # duration per frequency
+noise_std = 1e-4             # tiny additive noise
+
+print("✅ setup done. outputs will be in:", OUT_DIR)
+
+# helper function
+
+# === helpers: single-bin DFT & IO ===
+def phasor_at_freq(x, t, f):
+    """Single-bin complex DFT at frequency f. Returns complex phasor X for x(t) ≈ Re{X e^{j 2π f t}}."""
+    ej = np.exp(-1j * 2 * np.pi * f * t)
+    return 2.0 * np.mean(x * ej)
+
+
+# === models: Zg(ω) and Ya(ω) in dq ===
+def Zg_matrix(omega):
+    """
+    Grid impedance Zg(ω) in dq (2x2):
+      Zg = [[ Rg + jωLg,   -j k ω Lg ],
+            [ +j k ω Lg,    Rg + jωLg ]]
+    Tweak Rg, Lg, k to change the grid.
+    """
+    Rg = 0.05
+    Lg = 0.2e-3
+    k  = 0.15
+    jwL = 1j * omega * Lg
+    Zdd = Rg + jwL
+    Zqq = Rg + jwL
+    Zdq = -1j * k * omega * Lg
+    Zqd = +1j * k * omega * Lg
+    return np.array([[Zdd, Zdq],
+                     [Zqd, Zqq]], dtype=np.complex128)
+
+def Ya_matrix(omega):
+    """
+    Converter admittance Ya(ω) in dq (2x2), diagonal 1st-order roll-off:
+      Ya = diag( Y0 / (1 + j ω / ωc) )
+    Tweak Y0 and ωc to change converter "stiffness" and bandwidth.
+    """
+    Y0  = 20.0
+    wc  = 2 * pi * 150.0    # corner ≈ 150 Hz
+    Ysc = Y0 / (1.0 + 1j * omega / wc)
+    return np.array([[Ysc, 0.0],
+                     [0.0, Ysc]], dtype=np.complex128)
+
+def Y_total(omega):
+    """Total admittance at PCC: Y_tot = Ya + inv(Zg)."""
+    return Ya_matrix(omega) + np.linalg.inv(Zg_matrix(omega))
+
+print("✅ model functions ready.")
+
+
+# === synthesize time-series CSVs for each frequency & axis ===
+csv_paths = []
+for inj_axis in ("d","q"):
+    for f in freqs:
+        T = cycles_per_freq / f
+        N = int(round(T * fs))
+        t = np.arange(N) / fs
+        w = 2 * pi * f
+
+        # small voltage injection phasor
+        Vinj = np.array([A + 0j, 0 + 0j]) if inj_axis == "d" else np.array([0 + 0j, A + 0j])
+
+        # true admittance and current response
+        Yw = Y_total(w)
+        Iph = Yw @ Vinj
+
+        # time signals: x(t) = Re{ X e^{jwt} }
+        ejwt = np.exp(1j * w * t)
+        Vd = np.real(Vinj[0] * ejwt)
+        Vq = np.real(Vinj[1] * ejwt)
+        Id = np.real(Iph[0] * ejwt)
+        Iq = np.real(Iph[1] * ejwt)
+
+        # tiny white noise (optional)
+        rng = np.random.default_rng(42 if inj_axis=="d" else 43)
+        Vd += rng.normal(0, noise_std, size=N)
+        Vq += rng.normal(0, noise_std, size=N)
+        Id += rng.normal(0, noise_std, size=N)
+        Iq += rng.normal(0, noise_std, size=N)
+
+        df = pd.DataFrame({"time": t, "Vd": Vd, "Vq": Vq, "Id": Id, "Iq": Iq})
+        path = os.path.join(OUT_DIR, f"run_{inj_axis}_{int(f)}Hz.csv")
+        df.to_csv(path, index=False)
+        csv_paths.append(path)
+
+print("✅ synthetic CSVs written:", len(csv_paths))
+print("example:", csv_paths[0])
+pd.read_csv(csv_paths[0]).head(10)
+
+
+# === estimate Y from CSVs, compare against truth, save tables & a plot ===
+rows_Y, rows_Zg, rows_Ya = [], [], []
+
+for f in freqs:
+    # load d and q injections
+    d = pd.read_csv(os.path.join(OUT_DIR, f"run_d_{int(f)}Hz.csv"))
+    q = pd.read_csv(os.path.join(OUT_DIR, f"run_q_{int(f)}Hz.csv"))
+
+    # phasors via single-bin complex DFT
+    Vd_d = phasor_at_freq(d["Vd"].to_numpy(), d["time"].to_numpy(), f)
+    Vq_d = phasor_at_freq(d["Vq"].to_numpy(), d["time"].to_numpy(), f)
+    Id_d = phasor_at_freq(d["Id"].to_numpy(), d["time"].to_numpy(), f)
+    Iq_d = phasor_at_freq(d["Iq"].to_numpy(), d["time"].to_numpy(), f)
+
+    Vd_q = phasor_at_freq(q["Vd"].to_numpy(), q["time"].to_numpy(), f)
+    Vq_q = phasor_at_freq(q["Vq"].to_numpy(), q["time"].to_numpy(), f)
+    Id_q = phasor_at_freq(q["Id"].to_numpy(), q["time"].to_numpy(), f)
+    Iq_q = phasor_at_freq(q["Iq"].to_numpy(), q["time"].to_numpy(), f)
+
+    # build matrices with columns = injections
+    V = np.array([[Vd_d, Vd_q],
+                  [Vq_d, Vq_q]], dtype=np.complex128)
+    I = np.array([[Id_d, Id_q],
+                  [Iq_d, Iq_q]], dtype=np.complex128)
+
+    # FRF estimate: Y_meas = I * inv(V)
+    Y_meas = I @ np.linalg.inv(V)
+
+    # truth at this frequency
+    w = 2 * pi * f
+    Y_true = Y_total(w)
+    Zg_true = Zg_matrix(w)
+    Ya_true = Ya_matrix(w)
+
+    # pack rows (Re/Im split per entry)
+    def row_from_mat(f, M, prefix):
+        row = {"f_Hz": f}
+        for tag,(r,c) in {"dd":(0,0),"dq":(0,1),"qd":(1,0),"qq":(1,1)}.items():
+            row[f"{prefix}_{tag}_Re"] = np.real(M[r,c])
+            row[f"{prefix}_{tag}_Im"] = np.imag(M[r,c])
+        return row
+
+    rows_Y.append(  {**row_from_mat(f, Y_meas, "Y_meas"), **row_from_mat(f, Y_true, "Y_true")} )
+    rows_Zg.append( row_from_mat(f, Zg_true, "Zg") )
+    rows_Ya.append( row_from_mat(f, Ya_true, "Ya") )
+
+# save CSVs
+dfY  = pd.DataFrame(rows_Y).sort_values("f_Hz")
+dfZg = pd.DataFrame(rows_Zg).sort_values("f_Hz")
+dfYa = pd.DataFrame(rows_Ya).sort_values("f_Hz")
+
+dfY.to_csv(os.path.join(OUT_DIR, "Y_measured_vs_true.csv"), index=False)
+dfZg.to_csv(os.path.join(OUT_DIR, "Zg_true.csv"), index=False)
+dfYa.to_csv(os.path.join(OUT_DIR, "Ya_true.csv"), index=False)
+
+print("✅ saved:")
+print(" -", os.path.join(OUT_DIR, "Y_measured_vs_true.csv"))
+print(" -", os.path.join(OUT_DIR, "Zg_true.csv"))
+print(" -", os.path.join(OUT_DIR, "Ya_true.csv"))
+
+# quick visual check: |Ydd|
+Ydd_meas = np.abs(dfY["Y_meas_dd_Re"] + 1j*dfY["Y_meas_dd_Im"])
+Ydd_true = np.abs(dfY["Y_true_dd_Re"] + 1j*dfY["Y_true_dd_Im"])
+plt.figure()
+plt.title("Magnitude of Ydd (measured vs true)")
+plt.xlabel("Frequency [Hz]")
+plt.ylabel("|Ydd| [pu]")
+plt.plot(dfY["f_Hz"], Ydd_meas, marker="o", label="measured")
+plt.plot(dfY["f_Hz"], Ydd_true, marker="x", label="true")
+plt.grid(True); plt.legend()
+plt.show()
+
+dfY.head(8)
+
