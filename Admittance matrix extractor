@@ -1,0 +1,231 @@
+import numpy as np
+
+# =========================
+# 1) CONFIG / USER KNOBS
+# =========================
+PCCs = [0, 1, 2]                  # PCC indices
+f = np.logspace(0, 3, 9)          # Hz (1 ... 1000)
+w = 2*np.pi*f
+m = len(PCCs)
+
+fs = 10_000.0                     # sample rate for time logs (match RSCAD later)
+Ainj = 0.01                       # injected current peak amplitude (pu or A, consistent)
+n_cycles_time = 12                # cycles per frequency in time-domain logs
+n_cycles_dft  = 10                # cycles used in DFT extraction window
+
+# =========================
+# 2) TOY NETWORK (only for synthesizing logs now)
+# =========================
+def line_admittance_RL(R, L, w):
+    Z = R + 1j*w*L
+    return 1/Z
+
+def Ygrid_multiport(w, PCCs):
+    """Return Yg(W,m,m) at PCCs only (no hidden nodes)."""
+    m = len(PCCs); W = len(w)
+    Yg = np.zeros((W, m, m), dtype=complex)
+    # pairwise RL links
+    for i in range(m):
+        for j in range(i+1, m):
+            R = 0.10 + 0.02*(i+j)
+            L = (2e-3) + 0.5e-3*i
+            Yij = line_admittance_RL(R, L, w)
+            Yg[:, i, i] += Yij
+            Yg[:, j, j] += Yij
+            Yg[:, i, j] -= Yij
+            Yg[:, j, i] -= Yij
+    # shunt C at each PCC
+    for i in range(m):
+        Csh = 1e-6*(i+1)
+        Yg[:, i, i] += 1j*w*Csh
+    return Yg  # (W,m,m)
+
+def Yconv_per_PCC(w, PCCs):
+    """Per-PCC 2x2 dq converter admittance (toy, diagonal), dict p -> (W,2,2)."""
+    out = {}
+    for k,p in enumerate(PCCs):
+        Y0  = 15.0 + 2.0*k
+        wc  = 2*np.pi*(120 + 30*k)
+        Yw  = Y0 / (1 + 1j*w/wc)           # (W,)
+        Ypq = np.zeros((len(w),2,2), dtype=complex)
+        Ypq[:,0,0] = Yw
+        Ypq[:,1,1] = Yw
+        out[p] = Ypq
+    return out
+
+def lift_Ygrid_to_dq(Yg):
+    """Map scalar Yg(W,m,m) to dq block Yg_dq(W,2m,2m) with diag blocks [y 0; 0 y]."""
+    W, m, _ = Yg.shape
+    Yg_dq = np.zeros((W, 2*m, 2*m), dtype=complex)
+    for k in range(W):
+        for i in range(m):
+            for j in range(m):
+                y = Yg[k,i,j]
+                Yg_dq[k, 2*i:2*i+2, 2*j:2*j+2] = np.array([[y,0],[0,y]], dtype=complex)
+    return Yg_dq
+
+def assemble_Yconv_blockdiag(Yc_dict, PCCs):
+    """Block-diagonal stack of converter Y: (W,2m,2m)."""
+    W = next(iter(Yc_dict.values())).shape[0]
+    Yc = np.zeros((W, 2*m, 2*m), dtype=complex)
+    for k in range(W):
+        for i,p in enumerate(PCCs):
+            Yc[k, 2*i:2*i+2, 2*i:2*i+2] = Yc_dict[p][k]
+    return Yc
+
+# analytic Ys (used ONLY to synthesize logs for testing; replace with RSCAD logs later)
+Yg = Ygrid_multiport(w, PCCs)        # (W,m,m)
+Yg_dq = lift_Ygrid_to_dq(Yg)         # (W,2m,2m)
+Yc_dict = Yconv_per_PCC(w, PCCs)     # dict p -> (W,2,2)
+Yc_dq = assemble_Yconv_blockdiag(Yc_dict, PCCs)  # (W,2m,2m)
+Ytot_dq_analytic = Yg_dq + Yc_dq
+
+# =========================
+# 3) DFT HELPERS (current-source path)
+# =========================
+def _map_idx(p, axis):  # dq ordering helper
+    return 2*p + (0 if axis == 'd' else 1)
+
+def phasor_at_freq(x, fs, f0, n_cycles=10, window='hann'):
+    """Complex peak phasor of real x at f0 using integer-cycle window."""
+    spc = int(round(fs/f0))
+    N = max(spc*n_cycles, spc)
+    if N > len(x):
+        N = (len(x)//spc)*spc
+        if N <= 0:
+            raise ValueError("Trace too short for even one full cycle.")
+    xw = x[-N:] - np.mean(x[-N:])
+    if window == 'hann':
+        wdw = np.hanning(N); cg = np.sum(wdw)/N; xw = xw*wdw/cg
+    n = np.arange(N)
+    expo = np.exp(-1j * 2*np.pi * f0 * n / fs)
+    return (2.0/N) * np.sum(xw * expo)  # complex peak (not RMS)
+
+def estimate_Z_from_time_current_inj(data, freqs, fs, PCCs, n_cycles=10):
+    """
+    Build Z_dq(W,2m,2m) from *current* injections.
+    data key: (f0, p_inj, axis) with time-series arrays Vd,Vq,Id,Iq of shape (N,m).
+    Column = V(f0) / I_injected(f0).  Order: [d0,q0,d1,q1,...]
+    """
+    m, W = len(PCCs), len(freqs)
+    Zdq = np.zeros((W, 2*m, 2*m), dtype=complex)
+    for k, f0 in enumerate(freqs):
+        for p in PCCs:
+            for axis in ('d','q'):
+                run = data[(f0, p, axis)]
+                Vd,Vq,Id,Iq = map(np.asarray, (run['Vd'], run['Vq'], run['Id'], run['Iq']))
+                # phasors at all PCCs
+                Vd_ph = np.array([phasor_at_freq(Vd[:,j], fs, f0, n_cycles) for j in PCCs])
+                Vq_ph = np.array([phasor_at_freq(Vq[:,j], fs, f0, n_cycles) for j in PCCs])
+                Id_ph = np.array([phasor_at_freq(Id[:,j], fs, f0, n_cycles) for j in PCCs])
+                Iq_ph = np.array([phasor_at_freq(Iq[:,j], fs, f0, n_cycles) for j in PCCs])
+                # injected current (only one component non-zero ideally)
+                iinj = Id_ph[p] if axis=='d' else Iq_ph[p]
+                if abs(iinj) < 1e-12:
+                    raise ValueError(f"Tiny injected current at f={f0} Hz, PCC {p}, axis {axis}")
+                # assemble voltage vector
+                Vvec = np.empty(2*m, dtype=complex)
+                for j in PCCs:
+                    Vvec[_map_idx(j,'d')] = Vd_ph[j]
+                    Vvec[_map_idx(j,'q')] = Vq_ph[j]
+                # column of Z
+                Zdq[k, :, _map_idx(p, axis)] = Vvec / iinj   # v = Z i
+    return Zdq
+
+def invert_stack_per_freq(Mstack):
+    """Invert (or pseudo-invert) each [2m×2m] slice along axis 0."""
+    out = np.zeros_like(Mstack, dtype=complex)
+    for k in range(Mstack.shape[0]):
+        out[k] = np.linalg.pinv(Mstack[k])
+    return out
+
+# =========================
+# 4) SYNTHESIZE LOGS (for testing current injections ONLY)
+#    (Skip this when you plug in real RSCAD logs.)
+# =========================
+def synth_traces_from_Z(Z_dq, f, fs, PCCs, Ainj=0.01, n_cycles=12):
+    """Create data dict with t, Vd/Vq, Id/Iq for all (freq, pcc, axis) under current injection."""
+    m = len(PCCs); data = {}
+    for k, f0 in enumerate(f):
+        w0 = 2*np.pi*f0
+        spc = int(round(fs/f0))
+        N = spc * n_cycles
+        t = np.arange(N)/fs
+        sin = np.sin(w0*t); cos = np.cos(w0*t)
+        for p in PCCs:
+            for axis in ('d','q'):
+                # inject current on one dq component
+                icol = np.zeros(2*m, dtype=float)
+                icol[_map_idx(p,axis)] = Ainj
+                # build time currents (only injected comp non-zero)
+                Id = np.zeros((N,m)); Iq = np.zeros((N,m))
+                for j in PCCs:
+                    Id[:,j] = icol[_map_idx(j,'d')] * sin
+                    Iq[:,j] = icol[_map_idx(j,'q')] * sin
+                # phasor voltages: V = Z * I
+                Vphas = Z_dq[k] @ icol.astype(complex)
+                Vd = np.zeros((N,m)); Vq = np.zeros((N,m))
+                for j in PCCs:
+                    Vd_ph = Vphas[_map_idx(j,'d')]
+                    Vq_ph = Vphas[_map_idx(j,'q')]
+                    # v(t) = Re* sin + Im* cos
+                    Vd[:,j] = np.real(Vd_ph)*sin + np.imag(Vd_ph)*cos
+                    Vq[:,j] = np.real(Vq_ph)*sin + np.imag(Vq_ph)*cos
+                data[(f0, p, axis)] = {"t": t, "Vd": Vd, "Vq": Vq, "Id": Id, "Iq": Iq}
+    return data
+
+# =========================
+# 5) RUN: converters-only → Ya, grid-only → Yg, then L and det(I+L)
+# =========================
+# Build impedance stacks for synthesis only (invert analytic Ys)
+Za_for_synth = invert_stack_per_freq(Yc_dq)        # converters-only impedance
+Zg_for_synth = invert_stack_per_freq(Yg_dq)        # grid-only impedance
+Ztot_for_synth = invert_stack_per_freq(Ytot_dq_analytic)
+
+# --- Converters-only run (get Ya directly via current injections) ---
+data_conv = synth_traces_from_Z(Za_for_synth, f, fs, PCCs, Ainj=Ainj, n_cycles=n_cycles_time)
+Za_dq_from_logs = estimate_Z_from_time_current_inj(data_conv, f, fs, PCCs, n_cycles=n_cycles_dft)
+Ya_dq = invert_stack_per_freq(Za_dq_from_logs)     # converter admittance in f-domain
+
+# --- Grid-only run ---
+data_grid = synth_traces_from_Z(Zg_for_synth, f, fs, PCCs, Ainj=Ainj, n_cycles=n_cycles_time)
+Zg_dq_from_logs = estimate_Z_from_time_current_inj(data_grid, f, fs, PCCs, n_cycles=n_cycles_dft)
+Yg_dq = invert_stack_per_freq(Zg_dq_from_logs)     # grid admittance in f-domain
+
+# --- (Optional) Full system run (sanity) ---
+data_full = synth_traces_from_Z(Ztot_for_synth, f, fs, PCCs, Ainj=Ainj, n_cycles=n_cycles_time)
+Ztot_dq = estimate_Z_from_time_current_inj(data_full, f, fs, PCCs, n_cycles=n_cycles_dft)
+Ytot_dq = invert_stack_per_freq(Ztot_dq)
+
+# --- Loop gain & determinant for GNC ---
+L_dq = np.zeros_like(Ya_dq)
+det_IpL = np.zeros(len(f), dtype=complex)
+for k in range(len(f)):
+    L = Ya_dq[k] @ Zg_dq_from_logs[k]            # L = Ya * Zg (current-source framing)
+    L_dq[k] = L
+    det_IpL[k] = np.linalg.det(np.eye(2*m) + L)
+
+# =========================
+# 6) OUTPUTS (frequency domain)
+# =========================
+def cfmt(z): return f"{z.real:.3e}{z.imag:+.3e}j"
+print("Shapes (W, 2m, 2m):")
+print("Ya_dq (converters) :", Ya_dq.shape)
+print("Yg_dq (grid)       :", Yg_dq.shape)
+print("Ytot_dq (full)     :", Ytot_dq.shape)
+print("L_dq (loop gain)   :", L_dq.shape)
+print("det(I+L)           :", det_IpL.shape, "(one complex per frequency)")
+
+# small preview at three frequencies
+subset = [0, len(f)//2, len(f)-1]
+for name, Y in [("Ya", Ya_dq), ("Yg", Yg_dq), ("Ytot", Ytot_dq)]:
+    for idx in subset:
+        print(f"\n--- {name}(dq) @ f = {f[idx]:.2f} Hz ---")
+        M = Y[idx]
+        for r in range(2*m):
+            print(" ", " ".join(cfmt(M[r,c]) for c in range(2*m)))
+
+print("\nSample det(I+L) values (first/mid/last freq):")
+print(f"{f[subset[0]]:.2f} Hz -> {cfmt(det_IpL[subset[0]])}")
+print(f"{f[subset[1]]:.2f} Hz -> {cfmt(det_IpL[subset[1]])}")
+print(f"{f[subset[2]]:.2f} Hz -> {cfmt(det_IpL[subset[2]])}")
