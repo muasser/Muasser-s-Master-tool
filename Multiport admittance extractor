@@ -1,0 +1,98 @@
+import numpy as np
+import pandas as pd
+from math import pi
+
+# Parameters
+fs = 10_000.0                  # sample rate [Hz]
+A  = 0.01                      # current injection amplitude [pu]
+freqs = [10.0, 25.0, 50.0, 120.0]  # test frequencies [Hz]
+cycles_per_freq = 20           # duration per frequency
+noise_std = 1e-4               # additive measurement noise
+
+N_ports = 3
+
+# Grid and converter setup
+grid_params = {
+    'Rg': [0.05, 0.05, 0.05],
+    'Lg': [0.2e-3, 0.2e-3, 0.2e-3],
+    'k': 0.10               # coupling between ports
+}
+conv_params = {
+    'Y0': [20.0, 16.0, 18.0],
+    'wc': [2*pi*150.0, 2*pi*120.0, 2*pi*100.0]
+}
+
+def Zg_matrix_multiport(omega, grid_params):
+    N = len(grid_params['Rg'])
+    Zg = np.zeros((N, N), dtype=np.complex128)
+    for i in range(N):
+        for j in range(N):
+            if i == j:
+                Zg[i, j] = grid_params['Rg'][i] + 1j*omega*grid_params['Lg'][i]
+            else:
+                Zg[i, j] = -1j*grid_params['k']*omega*np.sqrt(grid_params['Lg'][i]*grid_params['Lg'][j])
+    return Zg
+
+def Ya_matrix_multiport(omega, conv_params):
+    N = len(conv_params['Y0'])
+    Ya = np.zeros((N, N), dtype=np.complex128)
+    for i in range(N):
+        Ysc = conv_params['Y0'][i] / (1.0 + 1j * omega / conv_params['wc'][i])
+        Ya[i, i] = Ysc
+    return Ya
+
+def Ynode_matrix(omega, conv_params, grid_params):
+    Ya = Ya_matrix_multiport(omega, conv_params)
+    Zg = Zg_matrix_multiport(omega, grid_params)
+    Ynode = Ya + np.linalg.inv(Zg)
+    return Ynode
+
+def phasor_at_freq(x, t, f):
+    """Single-bin complex DFT at frequency f."""
+    ej = np.exp(-1j * 2 * np.pi * f * t)
+    return 2.0 * np.mean(x * ej)
+
+# Injection, measurement, DFT, admittance reconstruction
+for f in freqs:
+    w = 2 * pi * f
+    T = cycles_per_freq / f
+    N = int(round(T * fs))
+    t = np.arange(N) / fs
+
+    # Prepare storage for phasors (per PCC, per injection)
+    V_phasors = np.zeros((N_ports, N_ports), dtype=np.complex128)
+    I_phasors = np.zeros((N_ports, N_ports), dtype=np.complex128)
+
+    # Inject current at each PCC one-by-one
+    for inj_pcc in range(N_ports):
+        Iinj = np.zeros(N_ports, dtype=np.complex128)
+        Iinj[inj_pcc] = A
+
+        # Get admittance and synthesize voltage response
+        Ynode = Ynode_matrix(w, conv_params, grid_params)
+        Vresp = np.linalg.solve(Ynode, Iinj)
+
+        # Time signals
+        signals = []
+        for k in range(N_ports):
+            Vi = np.real(Vresp[k] * np.exp(1j * w * t))
+            Ii = np.real(Iinj[k] * np.exp(1j * w * t))
+            rng = np.random.default_rng(int(42 + f + k))
+            Vi += rng.normal(0, noise_std, size=N)
+            Ii += rng.normal(0, noise_std, size=N)
+            signals.append((Vi, Ii))
+
+        # DFT: extract phasors
+        for k in range(N_ports):
+            Vi, Ii = signals[k]
+            V_phasors[k, inj_pcc] = phasor_at_freq(Vi, t, f)
+            I_phasors[k, inj_pcc] = phasor_at_freq(Ii, t, f)
+
+    # Build admittance matrix: Y_meas = I_phasors @ inv(V_phasors)
+    Y_meas = I_phasors @ np.linalg.inv(V_phasors)
+    print(f"freq={f}Hz\nY_meas:\n", Y_meas)
+
+    # NEW: Extract, display Yedge (diagonals of Y_meas) for each port
+    Yedge = np.diag(Y_meas)
+    print(f"Yedge at {f}Hz (diagonal admittances): {Yedge}\n")
+
