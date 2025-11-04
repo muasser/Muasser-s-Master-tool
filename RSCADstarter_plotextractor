@@ -1,0 +1,75 @@
+# -*- coding: utf-8 -*-
+import os, time
+import rtds.rscadfx
+import matplotlib.pyplot as plt
+
+CASEFILE = r"C:\Users\muass\OneDrive\Documenten\RSCAD\RTDS_USER_FX\fileman\CH1-VoltageDivider\vdiv.rtfx"
+
+# where to save PNG from matplotlib
+OUTDIR = os.path.join(os.path.expanduser("~"), "Documents", "RSCAD", "Outputs")
+os.makedirs(OUTDIR, exist_ok=True)
+
+with rtds.rscadfx.remote_connection() as app:
+    try:
+        case = app.open_case(CASEFILE)
+        case.stop()
+        case.compile()
+        case.run()
+        time.sleep(0.5)
+
+        # === find the source magnitude control ===
+        Mag = case.get_object_by_name("ABCmag", "slider")
+
+        # === choose ONE signal from the Node Voltages plot ===
+        # You can find the exact path by right-clicking a trace -> Properties in Runtime.
+        # Commonly it's something like "Subsystem #1|Node Voltages|S1) NA"
+        sig_path = "Subsystem #1|Node Voltages|S1) NA"
+        try:
+            signal = case.get_signal(sig_path, subtab="Draft", subpage="SS #1")
+        except Exception:
+            # try without the subtab/subpage if not needed
+            signal = case.get_signal(sig_path)
+
+        if signal is None:
+            raise RuntimeError(
+                f"Signal '{sig_path}' not found. "
+                "Check the exact runtime path shown in RSCAD → right-click the trace → Copy Path."
+            )
+
+        # === sweep three magnitudes and record data ===
+        magnitudes = [115, 57.5, 28.75]
+        fig, axes = plt.subplots(len(magnitudes), 1, figsize=(9, 8), sharex=True)
+        fig.suptitle("Stepping Down Source Magnitude (Matplotlib from RTDS signals)")
+
+        for i, val in enumerate(magnitudes):
+            Mag.value = val
+            print(f"Transition from 230 kV to {val} kV")
+            time.sleep(1.0)  # allow signal buffers to update
+
+            # read numeric buffers directly
+            y = signal.get_data()
+            t = signal.get_time_data()
+
+            if len(t) == 0 or len(y) == 0:
+                raise RuntimeError("Signal buffer is empty; extend sim time or wait longer before reading.")
+
+            ax = axes[i]
+            ax.plot(t, y)
+            ax.set_ylabel(f"{val} kV")
+            ax.grid(True)
+
+        axes[-1].set_xlabel("Time (s)")
+        plt.tight_layout()
+
+        png_path = os.path.join(OUTDIR, "vdiv_matplotlib_signal.png")
+        plt.savefig(png_path, dpi=150)
+        plt.show()
+        print("✅ Saved:", png_path)
+
+        Mag.value = 230
+        case.stop()
+        case.close()
+
+    except Exception as e:
+        print("Exception Occurred:", e)
+        raise SystemExit
