@@ -1,0 +1,71 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Nov  5 21:34:07 2025
+
+@author: muass
+"""
+
+# -*- coding: utf-8 -*-
+import rtds.rscadfx
+import time
+import csv
+import matplotlib.pyplot as plt
+
+# --- RSCAD: run & meet ---
+with rtds.rscadfx.remote_connection() as app:
+    try:
+        casefile = r"C:\Users\muass\OneDrive\Documenten\RSCAD\RTDS_USER_FX\fileman\CH1-VoltageDivider\vdiv.rtfx"
+        case = app.open_case(casefile)
+        case.compile()
+
+        Rload_draft = case.get_object_by_name("Rload", "slider")  # draft variable
+        Vrms        = case.get_object_by_name("Vrms", "meter")    # meter
+        Rload_sig   = case.get_signal("script signals|Rload")      # script signal (x)
+        Vratio_sig  = case.get_signal("script signals|Vload_Vsource")  # script signal (y)
+
+        Rload_list  = [0.01, 1.0, 2.0, 3.0, 4.0, 5.0]
+        Vratio_list = []
+        Vsource     = 230
+
+        for i, R in enumerate(Rload_list):
+            Rload_draft.value = R
+            case.run()
+            time.sleep(2)                  # geef meter tijd
+            Vload = Vrms.value
+            Vratio = Vload / Vsource
+            Vratio_list.append(Vratio)
+            print(f"The Vload/Vsource is {Vratio} when Rload = {R}")
+
+            # update voor runtime-plot in RSCAD
+            Vratio_sig.set_data(Vratio_list)
+            Rload_sig.set_data(Rload_list[:i+1])
+
+            case.stop()
+
+        # --- CSV opslaan (jouw pad) ---
+        csv_path = r"C:\Users\muass\OneDrive\Bureaublad\vdiv_xy_python.csv"
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Rload", "Vload/Vsource"])
+            w.writerows(zip(Rload_list, Vratio_list))
+        print(f"✅ Data saved to: {csv_path}")
+
+    except Exception as e:
+        print("Exception Occurred:", e)
+        raise SystemExit
+
+# --- CSV inlezen & plotten (na het wegschrijven) ---
+x, y = [], []
+with open(csv_path, "r") as f:
+    rdr = csv.reader(f)
+    next(rdr)  # header skip
+    for row in rdr:
+        x.append(float(row[0]))
+        y.append(float(row[1]))
+
+plt.plot(x, y, marker="o")
+plt.xlabel("Rload")
+plt.ylabel("Vload/Vsource")
+plt.title("Voltage Divider Curve (from CSV)")
+plt.grid(True)
+plt.show()
