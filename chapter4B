@@ -1,0 +1,73 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Nov  9 21:05:24 2025
+
+@author: muass
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Chapter 4 – Part B: Effect of Pre-Trigger Settings
+"""
+
+import rtds.rscadfx
+import matplotlib.pyplot as plt
+
+
+def pre_trigger(case):
+    """Apply a fault and study the effect of different pre-trigger settings."""
+    # get handles to the source's fault button and the voltage signal
+    fault = case.get_object_by_name("Ftrg", "button")
+    signal_name = "Subsystem #1|Node Voltages|S1) NA"  # Assigning the Voltage signal (phase A)
+    signal = case.get_signal(signal_name)
+
+    # create three subplots
+    fig, ax = plt.subplots(3, 1, figsize=(8, 8))
+    fig.suptitle("Effect of Pre-Trigger Settings")
+
+    # define different pre-trigger durations (percentage of total window)
+    Pre_Duration = [50, 20, 10]  # in percent
+
+    for i in range(3):
+        # change the graph pre-trigger time
+        case.settings.pretrigger_amount = Pre_Duration[i]
+
+        # apply fault (set ON then OFF)
+        fault.position = 1
+        fault.position = 0
+
+        # get the signal data
+        y1_data = signal.get_data()
+        x1_data = case.get_plot_time_data()
+
+        # plot results on each subplot
+        ax[i].plot(x1_data, y1_data)
+        ax[i].set_ylabel("kV")
+        ax[i].set_xlabel("Time (s)")
+        ax[i].set_title(f"Pre-Trigger = {Pre_Duration[i]} %")
+
+    plt.tight_layout()
+    plt.show()
+
+
+# --- Main RSCAD execution ---
+with rtds.rscadfx.remote_connection() as app:
+    try:
+        # open the case
+        casefile = r"C:\Users\muass\OneDrive\Documenten\RSCAD\RTDS_USER_FX\fileman\CH1-VoltageDivider\vdiv.rtfx"
+        case = app.open_case(casefile)
+
+        # compile and run
+        case.compile()
+        case.stop()
+        case.run()
+
+        # perform pre-trigger study
+        pre_trigger(case)
+
+        # stop and close
+        case.stop()
+        case.close()
+
+    except Exception as e:
+        print("Exception Occurred: " + f"{e}")
