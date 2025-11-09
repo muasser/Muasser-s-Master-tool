@@ -1,0 +1,73 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Nov  9 20:49:32 2025
+
+@author: muass
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Chapter 4 – Introducing Faults and Adjusting Plot Window Size
+"""
+
+import rtds.rscadfx
+import matplotlib.pyplot as plt
+
+
+def windowsize(case):
+    """Apply a fault and capture signal data with varying window durations."""
+    # get handles to the source's fault button and the voltage that will be faulted
+    fault = case.get_object_by_name("Ftrg", "button")
+    signal_name = "Subsystem #1|Node Voltages|S1) NA"  # voltage at N1
+    signal = case.get_signal(signal_name)
+
+    # create three subplots
+    fig, ax = plt.subplots(3, 1, figsize=(8, 8))
+    fig.suptitle("Graphs with Window Times of 0.5, 1.0, and 2.0 seconds")
+
+    # durations for each subplot
+    Duration = [0.5, 1.0, 2.0]
+
+    for i in range(3):
+        # change the graph window time
+        case.settings.plot_finish_time = Duration[i]
+
+        # apply fault (set ON then OFF)
+        fault.position = 1
+        fault.position = 0
+
+        # get the signal data
+        y1_data = signal.get_data()
+        x1_data = signal.get_time_data()
+
+        # populate the subplots one at a time
+        ax[i].plot(x1_data, y1_data)
+        ax[i].set_ylabel("Magnitude")
+        ax[i].set_title(f"Window = {Duration[i]} s")
+
+    plt.xlabel("Time (s)")
+    plt.tight_layout()
+    plt.show()
+
+
+# --- Main RSCAD execution ---
+with rtds.rscadfx.remote_connection() as app:
+    try:
+        # open the case
+        casefile = r"C:\Users\muass\OneDrive\Documenten\RSCAD\RTDS_USER_FX\fileman\CH1-VoltageDivider\vdiv.rtfx"
+        case = app.open_case(casefile)
+
+        # compile and run the case
+        case.compile()
+        case.stop()
+        case.run()
+
+        # perform fault study and window-size comparison
+        windowsize(case)
+
+        # stop and close the case
+        case.stop()
+        case.close()
+
+    except Exception as e:
+        print("Exception Occurred: " + f"{e}")
