@@ -1,0 +1,35 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Nov 16 05:30:32 2025
+
+@author: muass
+"""
+
+# -*- coding: utf-8 -*-
+import rtds.rscadfx
+import time
+
+casefile = r"C:\\Users\\muass\\OneDrive\\Documenten\\RSCAD\\RTDS_USER_FX\\fileman\\CH1-VoltageDivider\\vdiv.rtfx"
+
+with rtds.rscadfx.remote_connection() as app:
+    try:
+        case = app.open_case(casefile)
+        case.compile()
+
+        # Meter op de load-bus (pas naam aan als hij anders heet!)
+        Vrms = case.get_object_by_name("Vrms", "meter")
+
+        # Case starten
+        case.run()
+
+        # Simulatie even laten lopen tot ~5 s
+        time.sleep(5.0)
+
+        # Waarde uitlezen
+        V_val = Vrms.value
+        print(f"Spanning op load-bus rond t≈5 s: {V_val:.6f} V (rms)")
+
+        case.stop()
+
+    except Exception as e:
+        print("Exception occurred:", e)
