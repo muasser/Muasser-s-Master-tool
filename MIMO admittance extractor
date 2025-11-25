@@ -1,0 +1,188 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Nov 23 00:29:33 2025
+
+@author: muass
+"""
+
+import numpy as np
+
+# ---------------------------------------
+# 0. Instellingen
+# ---------------------------------------
+fs = 5000.0          # samplesnelheid [Hz]
+T  = 2.0             # meetduur [s]
+N  = int(T * fs)     # aantal samples
+t  = np.arange(N) / fs
+
+f_list = [10, 20, 30, 40, 60, 70, 80]   # injectiefrequenties [Hz]
+
+# "Neppe" PLL-hoek: in het echt komt dit uit je PLL (thetaPLL(t) uit RSCAD)
+f_pll = 50.0
+theta_pll = 2 * np.pi * f_pll * t      # [rad]
+
+
+# ---------------------------------------
+# 1. Hulpfuncties
+# ---------------------------------------
+
+def clarke_transform(ia, ib, ic):
+    """abc -> alpha-beta (power-invariant Clarke)"""
+    two_over_three = 2.0 / 3.0
+    alpha = two_over_three * (ia - 0.5*ib - 0.5*ic)
+    beta  = two_over_three * ((np.sqrt(3)/2) * (ib - ic))
+    return alpha, beta
+
+
+def park_transform(alpha, beta, theta):
+    """alpha-beta -> dq (Park)"""
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    d =  alpha * cos_t + beta * sin_t
+    q = -alpha * sin_t + beta * cos_t
+    return d, q
+
+
+def phasor_fft(x, fs, f_inj):
+    """
+    FFT van tijdsignaal x(t) met Hann-window.
+    Geeft complex phasor op de injectiefrequentie f_inj.
+    Schaal valt weg, want V en I krijgen dezelfde behandeling.
+    """
+    N = len(x)
+    w = np.hanning(N)
+    xw = x * w
+
+    X = np.fft.rfft(xw)
+    freqs = np.fft.rfftfreq(N, d=1/fs)
+    k = np.argmin(np.abs(freqs - f_inj))  # dichtstbijzijnde bin
+    return X[k]
+
+
+def generate_nep_voltages_multi(id_t, iq_t, f_inj, inj_pcc):
+    """
+    DEMO: maak neppe v_d(t), v_q(t) voor meerdere PCC's, gegeven Id/Iq(t).
+    In je echte versie vervang je dit volledig door echte RSCAD Vd/Vq:
+
+        vd_all[p, :] = Vd_tijdreeks van PCC p
+        vq_all[p, :] = Vq_tijdreeks van PCC p
+
+    Vorm vd_all, vq_all: (num_pcc, N)
+    """
+    num_pcc_demo = 3   # alleen voor demo; in het echt komt dit van jouw meetdata
+
+    omega = 2 * np.pi * f_inj
+    carrier = np.sin(omega * t)
+
+    vd_all = np.zeros((num_pcc_demo, len(t)))
+    vq_all = np.zeros((num_pcc_demo, len(t)))
+
+    for p in range(num_pcc_demo):
+        # simpele variatie per PCC zodat ze niet identiek zijn
+        a_p = 0.5 + 0.1 * p
+        b_p = 0.05
+        c_p = 0.10
+        d_p = 0.40 + 0.05 * p
+
+        vd_all[p, :] = (a_p * id_t + b_p * iq_t) * carrier
+        vq_all[p, :] = (c_p * id_t + d_p * iq_t) * carrier
+
+    return vd_all, vq_all
+
+
+# ---------------------------------------
+# 2. Hoofdloop over frequenties
+#    -> per f_inj: Y_big van vorm (2n x 2n)
+# ---------------------------------------
+
+for f_inj in f_list:
+    omega_inj = 2 * np.pi * f_inj
+
+    # Eerst één injectie-run doen om te weten hoeveel PCC's er zijn
+    ia_d_demo = np.sin(omega_inj * t)
+    ib_d_demo = np.sin(omega_inj * t - 2*np.pi/3)
+    ic_d_demo = np.sin(omega_inj * t + 2*np.pi/3)
+
+    alpha_d_demo, beta_d_demo = clarke_transform(ia_d_demo, ib_d_demo, ic_d_demo)
+    id_t_d_demo, iq_t_d_demo  = park_transform(alpha_d_demo, beta_d_demo, theta_pll)
+
+    vd_all_demo, vq_all_demo = generate_nep_voltages_multi(
+        id_t_d_demo, iq_t_d_demo, f_inj, inj_pcc=0
+    )
+
+    num_pcc = vd_all_demo.shape[0]      # <-- aantal Vd/Vq-sets bepaalt n
+    size = 2 * num_pcc                  # matrix wordt size x size
+
+    # Y_big: admittantie-matrix (we vullen direct I/V)
+    Y_big = np.zeros((size, size), dtype=complex)
+
+    # Multiport-opbouw: voor elke injectie-PCC een d- en q-injectie
+    for inj_pcc in range(num_pcc):
+
+        # ==========================
+        # a) D-INJECTIE op inj_pcc
+        # ==========================
+        ia_d = np.sin(omega_inj * t)
+        ib_d = np.sin(omega_inj * t - 2*np.pi/3)
+        ic_d = np.sin(omega_inj * t + 2*np.pi/3)
+
+        alpha_d, beta_d = clarke_transform(ia_d, ib_d, ic_d)
+        id_t_d, iq_t_d  = park_transform(alpha_d, beta_d, theta_pll)
+
+        vd_all_d, vq_all_d = generate_nep_voltages_multi(
+            id_t_d, iq_t_d, f_inj, inj_pcc
+        )
+
+        Id_d = phasor_fft(id_t_d, fs, f_inj)
+
+        col_d = 2 * inj_pcc  # kolomindex voor d-injectie op deze PCC
+
+        for p in range(num_pcc):
+            Vd_d = phasor_fft(vd_all_d[p, :], fs, f_inj)
+            Vq_d = phasor_fft(vq_all_d[p, :], fs, f_inj)
+
+            row_d = 2 * p      # rij voor Id_p / Iq_p hoort bij Vd_p/Vq_p
+            row_q = 2 * p + 1
+
+            # *** HIER AANGEPAST: admittance = I / V ***
+            Y_big[row_d, col_d] = Id_d / Vd_d
+            Y_big[row_q, col_d] = Id_d / Vq_d
+
+        # ==========================
+        # b) Q-INJECTIE op inj_pcc
+        # ==========================
+        ia_q = np.cos(omega_inj * t)
+        ib_q = np.cos(omega_inj * t - 2*np.pi/3)
+        ic_q = np.cos(omega_inj * t + 2*np.pi/3)
+
+        alpha_q, beta_q = clarke_transform(ia_q, ib_q, ic_q)
+        id_t_q, iq_t_q  = park_transform(alpha_q, beta_q, theta_pll)
+
+        vd_all_q, vq_all_q = generate_nep_voltages_multi(
+            id_t_q, iq_t_q, f_inj, inj_pcc
+        )
+
+        Iq_q = phasor_fft(iq_t_q, fs, f_inj)
+
+        col_q = 2 * inj_pcc + 1  # kolomindex voor q-injectie
+
+        for p in range(num_pcc):
+            Vd_q = phasor_fft(vd_all_q[p, :], fs, f_inj)
+            Vq_q = phasor_fft(vq_all_q[p, :], fs, f_inj)
+
+            row_d = 2 * p
+            row_q = 2 * p + 1
+
+            # *** HIER OOK AANGEPAST: I / V ***
+            Y_big[row_d, col_q] = Iq_q / Vd_q
+            Y_big[row_q, col_q] = Iq_q / Vq_q
+
+    # -----------------------------------
+    # Resultaat voor deze frequentie
+    # -----------------------------------
+    print(f"\n==============================")
+    print(f"f_inj = {f_inj:.1f} Hz")
+    print(f"aantal PCC's (afgeleid uit Vd/Vq sets): {num_pcc}")
+    print("Y_big shape:", Y_big.shape, "  (2n x 2n)")
+    print("Y_dq(jw) admittance-matrix:")
+    print(Y_big)
