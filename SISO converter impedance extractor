@@ -1,0 +1,157 @@
+import numpy as np
+
+# ---------------------------------------
+# 0. Instellingen
+# ---------------------------------------
+fs = 5000.0          # samplesnelheid [Hz]
+T  = 2.0             # meetduur [s]
+N  = int(T * fs)     # aantal samples
+t  = np.arange(N) / fs
+
+f_list = [10, 20, 30, 40, 60, 70, 80]   # injectiefrequenties [Hz]
+
+# "Neppe" PLL-hoek: in het echt komt dit uit je PLL
+# Hier gewoon een 50 Hz draaiende hoek
+f_pll = 50.0
+theta_pll = 2 * np.pi * f_pll * t      # [rad]
+
+
+# ---------------------------------------
+# 1. Hulpfuncties
+# ---------------------------------------
+
+def clarke_transform(ia, ib, ic):
+    """
+    abc -> alpha-beta (power-invariant Clark)
+    """
+    two_over_three = 2.0 / 3.0
+    alpha = two_over_three * (ia - 0.5*ib - 0.5*ic)
+    beta  = two_over_three * ((np.sqrt(3)/2)* (ib - ic))
+    return alpha, beta
+
+
+def park_transform(alpha, beta, theta):
+    """
+    alpha-beta -> dq (Park)
+    """
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    d =  alpha * cos_t + beta * sin_t
+    q = -alpha * sin_t + beta * cos_t
+    return d, q
+
+
+def phasor_fft(x, fs, f_inj):
+    """
+    Neemt FFT van tijdsignaal x(t) met Hann-window
+    en geeft de complex phasor terug op de injectiefrequentie f_inj.
+    Normalisatie is niet heel kritisch, zolang we V en I hetzelfde behandelen.
+    """
+    N = len(x)
+    w = np.hanning(N)
+    xw = x * w
+
+    X = np.fft.rfft(xw)
+    freqs = np.fft.rfftfreq(N, d=1/fs)
+
+    k = np.argmin(np.abs(freqs - f_inj))  # dichtstbijzijnde bin
+    return X[k]  # schaalfactor valt weg in Z = V / I
+
+
+def generate_nep_voltages(id_t, iq_t, f_inj):
+    """
+    Maak neppe v_d(t), v_q(t) tijdreeksen, alsof ze uit het systeem komen.
+    In het echt vervang je dit gewoon door gemeten Vd/Vq uit RSCAD.
+    Hier nemen we gewoon een simpele lineaire relatie:
+        [vd]   [a  b] [id]
+        [vq] = [c  d] [iq]
+    plus een klein extra faseverschilterm zodat het niet 100% triviaal is.
+    """
+    # voorbeeld 'echte' impedantie-matrix (constant over freq)
+    a = 0.5 + 0.1j
+    b = 0.05 - 0.02j
+    c = 0.10 + 0.03j
+    d = 0.40 + 0.05j
+
+    # maak van complex nummers reële tijdsignalen:
+    # gebruik alleen de reële delen door ze op een sinus van f_inj te leggen
+    omega = 2 * np.pi * f_inj
+    carrier = np.sin(omega * t)       # basisvorm
+
+    vd_t = (a.real * id_t + b.real * iq_t) * carrier
+    vq_t = (c.real * id_t + d.real * iq_t) * carrier
+    return vd_t, vq_t
+
+
+# ---------------------------------------
+# 2. Hoofdloop over frequenties
+# ---------------------------------------
+
+for f_inj in f_list:
+    omega_inj = 2 * np.pi * f_inj
+
+    # ==========================
+    # 2a. D-INJECTIE RUN
+    # ==========================
+    # 3-fase sinus injectie (amplitude 1 A)
+    ia_d = np.sin(omega_inj * t)
+    ib_d = np.sin(omega_inj * t - 2*np.pi/3)
+    ic_d = np.sin(omega_inj * t + 2*np.pi/3)
+
+    # Clarke -> Park -> Id, Iq (t-domein)
+    alpha_d, beta_d = clarke_transform(ia_d, ib_d, ic_d)
+    id_t_d, iq_t_d  = park_transform(alpha_d, beta_d, theta_pll)
+
+    # Neppe Vd/Vq tijdreeksen voor d-injectie
+    vd_t_d, vq_t_d = generate_nep_voltages(id_t_d, iq_t_d, f_inj)
+
+    # FFT -> phasors (frequentiedomein)
+    Id_d = phasor_fft(id_t_d, fs, f_inj)
+    Iq_d = phasor_fft(iq_t_d, fs, f_inj)
+    Vd_d = phasor_fft(vd_t_d, fs, f_inj)
+    Vq_d = phasor_fft(vq_t_d, fs, f_inj)
+
+    # We willen pure d-injectie: in het echt kies je je injector zo
+    # dat Iq_d ≈ 0. Hier is dat niet perfect, maar voor de structuur
+    # gaan we uit van ΔIq ≈ 0 -> gebruiken alleen Id_d in de deling.
+    Zdd = Vd_d / Id_d
+    Zqd = Vq_d / Id_d
+
+    # ==========================
+    # 2b. Q-INJECTIE RUN
+    # ==========================
+    # Zelfde idee maar met 90° faseverschil om vooral q-component te prikkelen
+    ia_q = np.cos(omega_inj * t)           # verschoven t.o.v. d-run
+    ib_q = np.cos(omega_inj * t - 2*np.pi/3)
+    ic_q = np.cos(omega_inj * t + 2*np.pi/3)
+
+    alpha_q, beta_q = clarke_transform(ia_q, ib_q, ic_q)
+    id_t_q, iq_t_q  = park_transform(alpha_q, beta_q, theta_pll)
+
+    vd_t_q, vq_t_q = generate_nep_voltages(id_t_q, iq_t_q, f_inj)
+
+    Id_q = phasor_fft(id_t_q, fs, f_inj)
+    Iq_q = phasor_fft(iq_t_q, fs, f_inj)
+    Vd_q = phasor_fft(vd_t_q, fs, f_inj)
+    Vq_q = phasor_fft(vq_t_q, fs, f_inj)
+
+    # Nu gaan we uit van ΔId ≈ 0 -> q-injectie
+    Zdq = Vd_q / Iq_q
+    Zqq = Vq_q / Iq_q
+
+    # ==========================
+    # 2c. Z_dq-matrix bouwen
+    # ==========================
+    Z_dq = np.array([[Zdd, Zdq],
+                     [Zqd, Zqq]], dtype=complex)
+
+    # ==========================
+    # 2d. Resultaat printen
+    # ==========================
+    print(f"\n=== f_inj = {f_inj:.1f} Hz ===")
+    print("Zdd =", Zdd)
+    print("Zdq =", Zdq)
+    print("Zqd =", Zqd)
+    print("Zqq =", Zqq)
+    print("Z_dq(jw) matrix:")
+    print(Z_dq)
