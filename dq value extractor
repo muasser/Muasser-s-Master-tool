@@ -1,0 +1,57 @@
+# -*- coding: utf-8 -*-
+import time
+import rtds.rscadfx
+
+# --- pas jouw pad hier aan
+casefile = r"C:\Users\muass\OneDrive\Documenten\RSCAD\RTDS_USER_FX\fileman\CH1-VoltageDivider\vdiv.rtfx"
+
+
+# --- frequenties voor kleine-signaal injectie
+inject_freqs = [5.0, 10.0, 20.0, 40.0, 60.0]    # Hz
+
+
+with rtds.rscadfx.remote_connection() as app:
+    try:
+        case = app.open_case(casefile)
+        case.compile()
+
+        # Draft variable (of slider) die jij aan de RAMP-Freq gekoppeld hebt
+        Finj_var = case.get_object_by_name("Finj", "slider")     # of "draft_variable"
+
+        # Meters (namen exact zoals in jouw runtime)
+        theta = case.get_object_by_name("thetaPLL11", "meter")
+        Vd    = case.get_object_by_name("Vdpu11",     "meter")
+        Vq    = case.get_object_by_name("Vqpu11",     "meter")
+        Id    = case.get_object_by_name("Id",         "meter")
+        Iq    = case.get_object_by_name("Iq",         "meter")
+
+
+        for f in inject_freqs:
+
+            print("\n====================================")
+            print(f"Injectiefrequentie instellen: f = {f:.2f} Hz")
+            print("====================================")
+
+            # --- zet injectie-frequentie
+            Finj_var.value = f
+
+            # --- run simulatie
+            case.run()
+
+            # wacht tot steady-state (+/- 5 sec)
+            time.sleep(2.0)
+
+            # waarden uitlezen
+            theta_val = theta.value
+            Vd_val    = Vd.value
+            Vq_val    = Vq.value
+            Id_val    = Id.value
+            Iq_val    = Iq.value
+
+            print(f"f = {f:5.2f} Hz | thetaPLL11 = {theta_val:8.6f} rad "
+                  f"| Vd = {Vd_val:9.6f} V | Vq = {Vq_val:9.6f} V | Id = {Id_val:9.6f} | Iq = {Iq_val:9.6f}")
+
+            case.stop()
+
+    except Exception as e:
+        print("Exception occurred:", e)
