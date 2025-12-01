@@ -1,0 +1,170 @@
+# -*- coding: utf-8 -*-
+import time
+import numpy as np
+import rtds.rscadfx
+
+# --------------------------------------------------
+# 0. Basisinstellingen
+# --------------------------------------------------
+
+# --- pad naar jouw RSCAD FX case
+casefile = r"C:\Users\muass\OneDrive\Documenten\RSCAD\RTDS_USER_FX\fileman\CH1-VoltageDivider\vdiv.rtfx"
+
+# --- frequenties voor kleine-signaal injectie [Hz]
+inject_freqs = [5.0, 10.0, 20.0, 40.0, 60.0]
+
+# --- meetinstellingen
+fs = 2000.0        # samplesnelheid [Hz]  (pas aan indien nodig)
+T_meas = 1.0       # meetduur [s]
+N = int(T_meas * fs)
+
+
+# --------------------------------------------------
+# 1. Hulpfunctie: phasor uit tijdserie via FFT
+# --------------------------------------------------
+
+def phasor_fft(x, fs, f_inj):
+    """
+    FFT van tijdsignaal x(t) met Hann-window.
+    Geeft complex phasor op de injectiefrequentie f_inj.
+    """
+    x = np.asarray(x)
+    N = len(x)
+    w = np.hanning(N)
+    xw = x * w
+
+    X = np.fft.rfft(xw)
+    freqs = np.fft.rfftfreq(N, d=1.0/fs)
+    k = np.argmin(np.abs(freqs - f_inj))
+    return X[k]
+
+
+# --------------------------------------------------
+# 2. RSCAD-verbinding en hoofdloop
+# --------------------------------------------------
+
+with rtds.rscadfx.remote_connection() as app:
+    try:
+        case = app.open_case(casefile)
+        case.compile()
+
+        # Slider / draft variable gekoppeld aan jouw RAMP-Freq
+        Finj_var = case.get_object_by_name("Finj", "slider")   # of "draft_variable"
+
+        # ======= PCC-definitie =======
+        # Voor nu: 1 PCC met de door jou gegeven namen.
+        # Als je later PCC2 toevoegt, maak je bijv.:
+        #   pcc_list = [
+        #       {"name": "PCC1", "Vd": Vdpu11, "Vq": Vqpu11, "Id": Id1, "Iq": Iq1},
+        #       {"name": "PCC2", "Vd": Vdpu22, "Vq": Vqpu22, "Id": Id2, "Iq": Iq2},
+        #   ]
+        Vd1 = case.get_object_by_name("Vdpu11", "meter")
+        Vq1 = case.get_object_by_name("Vqpu11", "meter")
+        Id1 = case.get_object_by_name("Id",      "meter")
+        Iq1 = case.get_object_by_name("Iq",      "meter")
+
+        pcc_list = [
+            {"name": "PCC1", "Vd": Vd1, "Vq": Vq1, "Id": Id1, "Iq": Iq1},
+        ]
+
+        num_pcc = len(pcc_list)
+        size = 2 * num_pcc   # Y is 2n x 2n
+
+        # Resultaten per frequentie opslaan (optioneel)
+        Y_results = {}
+
+        for f in inject_freqs:
+
+            print("\n====================================")
+            print(f"Injectiefrequentie instellen: f = {f:.2f} Hz")
+            print("====================================")
+
+            # --- 2.1. Zet injectiefrequentie
+            Finj_var.value = f
+
+            # --- 2.2. Start simulatie
+            case.run()
+
+            # kleine tijd om op te starten / stabiliseren
+            time.sleep(0.5)
+
+            # --- 2.3. Tijdseries alloceren: vorm (num_pcc, N)
+            Vd_ts = np.zeros((num_pcc, N))
+            Vq_ts = np.zeros((num_pcc, N))
+            Id_ts = np.zeros((num_pcc, N))
+            Iq_ts = np.zeros((num_pcc, N))
+
+            Ts = 1.0 / fs
+
+            # --- 2.4. Meten in tijd-domein
+            for k in range(N):
+                for p_idx, pcc in enumerate(pcc_list):
+                    Vd_ts[p_idx, k] = pcc["Vd"].value
+                    Vq_ts[p_idx, k] = pcc["Vq"].value
+                    Id_ts[p_idx, k] = pcc["Id"].value
+                    Iq_ts[p_idx, k] = pcc["Iq"].value
+
+                time.sleep(Ts)
+
+            # --- 2.5. Stop simulatie na meten
+            case.stop()
+
+            # --------------------------------------------------
+            # 3. Phasors per PCC in dq-domein
+            # --------------------------------------------------
+            Vd_ph = np.zeros(num_pcc, dtype=complex)
+            Vq_ph = np.zeros(num_pcc, dtype=complex)
+            Id_ph = np.zeros(num_pcc, dtype=complex)
+            Iq_ph = np.zeros(num_pcc, dtype=complex)
+
+            for p_idx in range(num_pcc):
+                Vd_ph[p_idx] = phasor_fft(Vd_ts[p_idx, :], fs, f)
+                Vq_ph[p_idx] = phasor_fft(Vq_ts[p_idx, :], fs, f)
+                Id_ph[p_idx] = phasor_fft(Id_ts[p_idx, :], fs, f)
+                Iq_ph[p_idx] = phasor_fft(Iq_ts[p_idx, :], fs, f)
+
+            # --------------------------------------------------
+            # 4. Y_conv opstellen (2n x 2n)
+            #    Simpelste vorm: kolommen 0 en 1 horen bij
+            #    d- en q-injectie op PCC1.
+            #    Later kun je voor extra PCC-injecties
+            #    extra runs doen en de overige kolommen vullen.
+            # --------------------------------------------------
+            Y_big = np.zeros((size, size), dtype=complex)
+
+            # Voor nu: we nemen aan dat de gemeten Id/Iq
+            # de respons zijn op d- en q-spanningen op elke PCC.
+            # We bouwen per PCC de 2 rijen:
+            #   row_d = 2*p_idx
+            #   row_q = 2*p_idx + 1
+            #
+            # En vullen alleen de eerste 2 kolommen (PCC1 d/q).
+            for p_idx in range(num_pcc):
+                row_d = 2 * p_idx
+                row_q = 2 * p_idx + 1
+
+                Vd = Vd_ph[p_idx]
+                Vq = Vq_ph[p_idx]
+                Idc = Id_ph[p_idx]
+                Iqc = Iq_ph[p_idx]
+
+                # beveiliging tegen deling door 0
+                if abs(Vd) > 1e-12:
+                    Y_big[row_d, 0] = Idc / Vd   # respons Id op Vd
+                    Y_big[row_q, 0] = Iqc / Vd   # respons Iq op Vd
+                if abs(Vq) > 1e-12:
+                    Y_big[row_d, 1] = Idc / Vq   # respons Id op Vq
+                    Y_big[row_q, 1] = Iqc / Vq   # respons Iq op Vq
+
+            # Resultaat opslaan
+            Y_results[f] = Y_big
+
+            # Printen
+            print(f"f = {f:5.2f} Hz")
+            print(f"aantal PCC's (op basis van gemeten sets): {num_pcc}")
+            print("Y_conv shape:", Y_big.shape, "  (2n x 2n)")
+            print("Y_conv(jw) admittance-matrix:")
+            print(Y_big)
+
+    except Exception as e:
+        print("Exception occurred:", e)
