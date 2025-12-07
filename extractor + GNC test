@@ -1,0 +1,247 @@
+# -*- coding: utf-8 -*-
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import rtds.rscadfx
+
+# --------------------------------------------------
+# 0. Basisinstellingen
+# --------------------------------------------------
+
+# --- pad naar jouw RSCAD FX case
+casefile = r"C:\Users\muass\OneDrive\Documenten\RSCAD\RTDS_USER_FX\fileman\CH1-VoltageDivider\vdiv.rtfx"
+
+# --- frequenties voor kleine-signaal injectie [Hz]
+inject_freqs = [5.0, 10.0, 20.0, 40.0, 60.0]
+
+# --- meetinstellingen
+fs = 2000.0        # samplesnelheid [Hz]  (pas aan indien nodig)
+T_meas = 1.0       # meetduur [s]
+N = int(T_meas * fs)
+
+
+# --------------------------------------------------
+# 1. Hulpfunctie: phasor uit tijdserie via FFT
+# --------------------------------------------------
+
+def phasor_fft(x, fs, f_inj):
+    """
+    FFT van tijdsignaal x(t) met Hann-window.
+    Geeft complex phasor op de injectiefrequentie f_inj.
+    """
+    x = np.asarray(x)
+    N = len(x)
+    w = np.hanning(N)
+    xw = x * w
+
+    X = np.fft.rfft(xw)
+    freqs = np.fft.rfftfreq(N, d=1.0/fs)
+    k = np.argmin(np.abs(freqs - f_inj))
+    return X[k]
+
+
+# --------------------------------------------------
+# 2. RSCAD-verbinding en hoofdloop
+# --------------------------------------------------
+
+with rtds.rscadfx.remote_connection() as app:
+    try:
+        case = app.open_case(casefile)
+        case.compile()
+
+        # Slider / draft variable gekoppeld aan jouw RAMP-Freq
+        Finj_var = case.get_object_by_name("Finj", "slider")   # of "draft_variable"
+
+        # ======= PCC-definitie =======
+        Vd1 = case.get_object_by_name("Vdpu11", "meter")
+        Vq1 = case.get_object_by_name("Vqpu11", "meter")
+        Id1 = case.get_object_by_name("Id",      "meter")
+        Iq1 = case.get_object_by_name("Iq",      "meter")
+
+        pcc_list = [
+            {"name": "PCC1", "Vd": Vd1, "Vq": Vq1, "Id": Id1, "Iq": Iq1},
+        ]
+
+        num_pcc = len(pcc_list)
+        size = 2 * num_pcc   # Y is 2n x 2n
+
+        # Resultaten per frequentie opslaan
+        Y_results = {}
+
+        for f in inject_freqs:
+
+            print("\n====================================")
+            print(f"Injectiefrequentie instellen: f = {f:.2f} Hz")
+            print("====================================")
+
+            # --- 2.1. Zet injectiefrequentie
+            Finj_var.value = f
+
+            # --- 2.2. Start simulatie
+            case.run()
+
+            # kleine tijd om op te starten / stabiliseren
+            time.sleep(0.5)
+
+            # --- 2.3. Tijdseries alloceren: vorm (num_pcc, N)
+            Vd_ts = np.zeros((num_pcc, N))
+            Vq_ts = np.zeros((num_pcc, N))
+            Id_ts = np.zeros((num_pcc, N))
+            Iq_ts = np.zeros((num_pcc, N))
+
+            Ts = 1.0 / fs
+
+            # --- 2.4. Meten in tijd-domein
+            for k in range(N):
+                for p_idx, pcc in enumerate(pcc_list):
+                    Vd_ts[p_idx, k] = pcc["Vd"].value
+                    Vq_ts[p_idx, k] = pcc["Vq"].value
+                    Id_ts[p_idx, k] = pcc["Id"].value
+                    Iq_ts[p_idx, k] = pcc["Iq"].value
+
+                time.sleep(Ts)
+
+            # --- 2.5. Stop simulatie na meten
+            case.stop()
+
+            # --------------------------------------------------
+            # 3. Phasors per PCC in dq-domein
+            # --------------------------------------------------
+            Vd_ph = np.zeros(num_pcc, dtype=complex)
+            Vq_ph = np.zeros(num_pcc, dtype=complex)
+            Id_ph = np.zeros(num_pcc, dtype=complex)
+            Iq_ph = np.zeros(num_pcc, dtype=complex)
+
+            for p_idx in range(num_pcc):
+                Vd_ph[p_idx] = phasor_fft(Vd_ts[p_idx, :], fs, f)
+                Vq_ph[p_idx] = phasor_fft(Vq_ts[p_idx, :], fs, f)
+                Id_ph[p_idx] = phasor_fft(Id_ts[p_idx, :], fs, f)
+                Iq_ph[p_idx] = phasor_fft(Iq_ts[p_idx, :], fs, f)
+
+            # --------------------------------------------------
+            # 4. Y_conv opstellen (2n x 2n)
+            # --------------------------------------------------
+            Y_big = np.zeros((size, size), dtype=complex)
+
+            for p_idx in range(num_pcc):
+                row_d = 2 * p_idx
+                row_q = 2 * p_idx + 1
+
+                Vd = Vd_ph[p_idx]
+                Vq = Vq_ph[p_idx]
+                Idc = Id_ph[p_idx]
+                Iqc = Iq_ph[p_idx]
+
+                # beveiliging tegen deling door 0
+                if abs(Vd) > 1e-12:
+                    Y_big[row_d, 0] = Idc / Vd   # respons Id op Vd
+                    Y_big[row_q, 0] = Iqc / Vd   # respons Iq op Vd
+                if abs(Vq) > 1e-12:
+                    Y_big[row_d, 1] = Idc / Vq   # respons Id op Vq
+                    Y_big[row_q, 1] = Iqc / Vq   # respons Iq op Vq
+
+            # Resultaat opslaan
+            Y_results[f] = Y_big
+
+            # Printen
+            print(f"f = {f:5.2f} Hz")
+            print(f"aantal PCC's (op basis van gemeten sets): {num_pcc}")
+            print("Y_conv shape:", Y_big.shape, "  (2n x 2n)")
+            print("Y_conv(jw) admittance-matrix:")
+            print(Y_big)
+
+            # --------------------------------------------------
+            # 5. Z_grid opstellen (2n x 2n) volgens Fan & Miao
+            #    Rg = 26.5 ohm, Lg = 0.7 H
+            # --------------------------------------------------
+            if 'Zgrid_results' not in locals():
+                Zgrid_results = {}
+                Ygrid_results = {}
+
+            R_g = 26.5
+            L_g = 0.7
+            omega0 = 2.0 * np.pi * 60.0      # nominale netfrequentie (rad/s)
+            s = 1j * 2.0 * np.pi * f         # s = j*omega voor scanfrequentie f
+
+            # 2x2 dq-gridimpedantie voor één PCC:
+            # Zdd = Zqq = Rg + s*Lg
+            # Zdq = -omega0 * Lg
+            # Zqd =  omega0 * Lg
+            Zdd = R_g + s * L_g
+            Zdq = -omega0 * L_g
+            Zqd =  omega0 * L_g
+
+            Z_2x2 = np.array([[Zdd, Zdq],
+                              [Zqd, Zdd]], dtype=complex)
+
+            # 2n x 2n Z_grid: blokdiagonaal met Z_2x2 per PCC
+            Z_grid = np.zeros((size, size), dtype=complex)
+            for p_idx in range(num_pcc):
+                i0 = 2 * p_idx
+                Z_grid[i0:i0+2, i0:i0+2] = Z_2x2
+
+            # Y_grid = Z_grid^-1 (zelfde blokdiagonaal structuur)
+            Y_2x2 = np.linalg.inv(Z_2x2)
+            Y_grid = np.zeros_like(Z_grid)
+            for p_idx in range(num_pcc):
+                i0 = 2 * p_idx
+                Y_grid[i0:i0+2, i0:i0+2] = Y_2x2
+
+            Zgrid_results[f] = Z_grid
+            Ygrid_results[f] = Y_grid
+
+            print("Z_grid(jw) impedantie-matrix:")
+            print(Z_grid)
+
+        # ------------------------------------------------------
+        # 6. GNC / Nyquist-analyse na alle frequenties
+        # ------------------------------------------------------
+        if len(Y_results) > 0 and len(Zgrid_results) > 0:
+            print("\n===== GNC / Nyquist analyse =====")
+
+            freqs = sorted(Y_results.keys())
+            G_vals = []   # det(I + L(jw)) per f
+
+            # drempel voor 'stabiel bij deze sample' (afstand tot 0)
+            tol = 1e-3
+
+            for f in freqs:
+                Y_conv = Y_results[f]
+                Z_grid = Zgrid_results[f]
+
+                I_mat = np.eye(Y_conv.shape[0], dtype=complex)
+                # Return ratio L(jw) = Z_grid * Y_conv
+                L_mat = Z_grid @ Y_conv
+
+                # Generalized Nyquist gebruikt det(I + L(jw))
+                G = np.linalg.det(I_mat + L_mat)
+                G_vals.append(G)
+
+                stable_here = (abs(G) > tol)
+                status = "STABIEL" if stable_here else "MOGELIJK ONSTABIEL / NABIJ GRENS"
+
+                print(f"f = {f:5.2f} Hz  |det(I + L)| = {abs(G):.3e}  --> {status}")
+
+            # Nyquist-plot van det(I + L(jw)) over alle frequenties
+            re_vals = [g.real for g in G_vals]
+            im_vals = [g.imag for g in G_vals]
+
+            plt.figure()
+            plt.plot(re_vals, im_vals, "-o")
+            for f, g in zip(freqs, G_vals):
+                plt.text(g.real, g.imag, f"{f:.0f}Hz", fontsize=8)
+
+            plt.axhline(0, linestyle="--")
+            plt.axvline(0, linestyle="--")
+            plt.scatter([-1], [0], marker="x")  # referentiepunt -1 voor klassieke Nyquist
+            plt.xlabel("Re{ det(I + L(jω)) }")
+            plt.ylabel("Im{ det(I + L(jω)) }")
+            plt.title("Generalized Nyquist-locus: det(I + L(jω))")
+            plt.grid(True)
+            plt.axis("equal")
+            plt.tight_layout()
+            plt.show()
+
+    except Exception as e:
+        print("Exception occurred:", e)
+
