@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+"""
+Created on Wed Dec  3 01:30:45 2025
+
+@author: muass
+"""
+
+# -*- coding: utf-8 -*-
 import time
 import numpy as np
 import rtds.rscadfx
@@ -165,6 +172,50 @@ with rtds.rscadfx.remote_connection() as app:
             print("Y_conv shape:", Y_big.shape, "  (2n x 2n)")
             print("Y_conv(jw) admittance-matrix:")
             print(Y_big)
+
+            # --------------------------------------------------
+            # 5. Z_grid opstellen (2n x 2n) volgens Fan & Miao
+            #    Rg = 26.5 ohm, Lg = 0.7 H
+            #    Per PCC een 2x2 dq-tak op de diagonaal
+            # --------------------------------------------------
+            if 'Zgrid_results' not in locals():
+                Zgrid_results = {}
+                Ygrid_results = {}
+
+            R_g = 26.5
+            L_g = 0.7
+            omega0 = 2.0 * np.pi * 60.0      # nominale netfrequentie (rad/s)
+            s = 1j * 2.0 * np.pi * f         # s = j*omega voor scanfrequentie f
+
+            # 2x2 dq-gridimpedantie voor één PCC:
+            # Zdd = Zqq = Rg + s*Lg
+            # Zdq = -omega0 * Lg
+            # Zqd =  omega0 * Lg
+            Zdd = R_g + s * L_g
+            Zdq = -omega0 * L_g
+            Zqd =  omega0 * L_g
+
+            Z_2x2 = np.array([[Zdd, Zdq],
+                              [Zqd, Zdd]], dtype=complex)
+
+            # 2n x 2n Z_grid: blokdiagonaal met Z_2x2 per PCC
+            Z_grid = np.zeros((size, size), dtype=complex)
+            for p_idx in range(num_pcc):
+                i0 = 2 * p_idx
+                Z_grid[i0:i0+2, i0:i0+2] = Z_2x2
+
+            # Optioneel: Y_grid = Z_grid^-1 (zelfde blokdiagonaal structuur)
+            Y_2x2 = np.linalg.inv(Z_2x2)
+            Y_grid = np.zeros_like(Z_grid)
+            for p_idx in range(num_pcc):
+                i0 = 2 * p_idx
+                Y_grid[i0:i0+2, i0:i0+2] = Y_2x2
+
+            Zgrid_results[f] = Z_grid
+            Ygrid_results[f] = Y_grid
+
+            print("Z_grid(jw) impedantie-matrix:")
+            print(Z_grid)
 
     except Exception as e:
         print("Exception occurred:", e)
