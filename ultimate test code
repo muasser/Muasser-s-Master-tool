@@ -1,0 +1,433 @@
+# -*- coding: utf-8 -*-
+"""
+Impedantie-extractie + GNC via eigenwaarden van L(jω)
+ROUTE A (RSCAD FX plotbuffer time-series via get_signal) + 2-run D/Q injectie
+
+NIEUW t.o.v. je SIN/COS variant:
+- Injectie: d-run en q-run (2 runs per frequentie)
+- d_gain / q_gain sliders sturen amplitude (0 of A_inj)
+- Reset via buttons PB en PB1 (pulse met .position = 1 -> 0)
+- Phasor extractie via LOCK-IN (dus geen FFT-bin mismatch)
+- Bouw Y_conv(jw) uit 2 runs:
+    [Id_d  Id_q]   =  Y * [Vd_d  Vd_q]
+    [Iq_d  Iq_q]          [Vq_d  Vq_q]
+  => Y = I_meas @ inv(V_exc)
+- Z_grid dq-model: [[R+sL, -w0 L],[+w0 L, R+sL]] block-diagonal per PCC
+- L(jw)=Y*Z, eigenwaarden, Nyquist eigenloci, encirclement count rond -1
+
+BELANGRIJK:
+1) Runtime -> Monitoring -> Plots -> Window Size >= 1.0 s (liefst groter bij lage f)
+2) Sliders alleen zetten wanneer case STOP
+3) Reset buttons pulsen vóór elke run (PB/PB1) om ramps te syncen
+"""
+
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import rtds.rscadfx
+
+# --------------------------------------------------
+# 0. Basisinstellingen
+# --------------------------------------------------
+casefile = r"C:\Users\muass\OneDrive\Documenten\RSCAD\RTDS_USER_FX\fileman\testcase.rtfx"
+
+# Sweep
+inject_freqs = list(range(5, 10, 1))  # pas aan naar wat jij wil (bv 1..100)
+
+A_inj      = 0.05   # injectie amplitude (pu/whatever jouw model gebruikt)
+SETTLE_S   = 1.0
+TIMEOUT_S  = 25.0
+MIN_SAMPLES = 1000
+
+# Invertibility / conditioning checks
+DET_THR   = 1e-12
+COND_THR  = 1e6
+
+# Grid params (zoals je oude code)
+R_g = 0.1468
+L_g = 1.46
+omega0 = 2.0 * np.pi * 60.0
+
+# Plot settings
+ZOOM_XLIM = (-5.0, 3.0)
+ZOOM_YLIM = (-5.0, 5.0)
+
+# --------------------------------------------------
+# 1. Hulpfuncties: lock-in + robust plotbuffer read
+# --------------------------------------------------
+def get_timeseries_consistent(case, sig_handles, timeout_s=30.0, min_samples=1000):
+    """
+    Wacht tot RSCAD FX plotbuffers gevuld zijn en consistente time series opleveren.
+    """
+    t_start = time.time()
+    last_len = -1
+    stable_count = 0
+
+    while time.time() - t_start < timeout_s:
+        case.update_plots()
+        time.sleep(0.2)
+
+        t_ref = None
+        data = {}
+        ok = True
+
+        for name, sig in sig_handles.items():
+            tt = np.asarray(sig.get_time_data())
+            xx = np.asarray(sig.get_data())
+
+            if len(tt) < min_samples or len(tt) != len(xx):
+                ok = False
+                break
+
+            if t_ref is None:
+                t_ref = tt
+            elif len(tt) != len(t_ref):
+                ok = False
+                break
+
+            data[name] = xx
+
+        if ok:
+            if len(t_ref) == last_len:
+                stable_count += 1
+            else:
+                stable_count = 0
+                last_len = len(t_ref)
+
+            if stable_count >= 2:
+                return t_ref, data
+
+    raise RuntimeError(
+        "Kon geen consistente time series ophalen (timeout). "
+        "Check: case RUNNING, plots bevatten alle signals, window size, update_plots."
+    )
+
+def lockin_phasor(x, t, f_inj, remove_dc=True, window=True):
+    """
+    Lock-in phasor exact op f_inj:
+      X = (2/N) * sum( x[n] * exp(-j 2π f t[n]) )
+    """
+    x = np.asarray(x, dtype=float)
+    t = np.asarray(t, dtype=float)
+
+    if remove_dc:
+        x = x - np.mean(x)
+
+    if window:
+        w = np.hanning(len(x))
+        x = x * w
+
+    ref = np.exp(-1j * 2.0 * np.pi * f_inj * t)
+    X = (2.0 / len(x)) * np.sum(x * ref)
+    return X
+
+def safe_stop(case):
+    try:
+        case.stop()
+    except Exception:
+        pass
+
+def pulse_reset_buttons(pb, pb1, pulse_s=0.05):
+    """
+    Pulse twee RSCAD buttons via .position:
+      position = 1 -> 0
+    """
+    pb.position = 1
+    pb1.position = 1
+    time.sleep(pulse_s)
+    pb.position = 0
+    pb1.position = 0
+
+def build_Zgrid_blockdiag(num_pcc, f, R_g, L_g, omega0):
+    """
+    Z_grid(jw) block-diagonal met dq-coupling per PCC:
+    Zdq = [[R+sL, -w0 L],[+w0 L, R+sL]]
+    """
+    size = 2 * num_pcc
+    s = 1j * 2.0 * np.pi * f
+    Zdd = R_g + s * L_g
+    Zdq = -omega0 * L_g
+    Zqd =  omega0 * L_g
+
+    Z_2x2 = np.array([[Zdd, Zdq],
+                      [Zqd, Zdd]], dtype=complex)
+
+    Z = np.zeros((size, size), dtype=complex)
+    for p in range(num_pcc):
+        i0 = 2 * p
+        Z[i0:i0+2, i0:i0+2] = Z_2x2
+    return Z
+
+# --------------------------------------------------
+# Fix: Branch tracking (eigenvalue continuation matching)
+# --------------------------------------------------
+def track_eig_branches(eig_results, freqs):
+    """
+    Match eigenvalues across frequency by minimal distance to previous point.
+    Returns list of branches, each branch is complex array length len(freqs).
+    """
+    e0 = np.array(eig_results[freqs[0]], dtype=complex)
+    nL = len(e0)
+    lam = np.zeros((nL, len(freqs)), dtype=complex)
+    lam[:, 0] = e0
+
+    for k in range(1, len(freqs)):
+        prev = lam[:, k-1]
+        cur = list(np.array(eig_results[freqs[k]], dtype=complex))
+
+        for i in range(nL):
+            d = [abs(cur[j] - prev[i]) for j in range(len(cur))]
+            jmin = int(np.argmin(d))
+            lam[i, k] = cur.pop(jmin)
+
+    return [lam[i, :] for i in range(nL)]
+
+# --------------------------------------------------
+# 2. PCC configuratie (scalable)
+# --------------------------------------------------
+pcc_list = [
+    {
+        "name": "PCC1",
+        "Vd_path": "Subsystem #1|CTLs|Vars|Vdpu11",
+        "Vq_path": "Subsystem #1|CTLs|Vars|Vqpu11",
+        "Id_path": "Subsystem #1|CTLs|Vars|Id",
+        "Iq_path": "Subsystem #1|CTLs|Vars|Iq",
+    },
+    # Voeg PCC2/PCC3 toe door extra dicts te plakken met hun eigen signal paths.
+]
+
+num_pcc = len(pcc_list)
+size = 2 * num_pcc
+
+# --------------------------------------------------
+# 3. Result containers
+# --------------------------------------------------
+Y_results = {}
+Zgrid_results = {}
+eig_results = {}
+L_results = {}
+
+# --------------------------------------------------
+# 4. RSCAD verbinding + sweep (D/Q runs)
+# --------------------------------------------------
+with rtds.rscadfx.remote_connection() as app:
+    case = app.open_case(casefile)
+    try:
+        safe_stop(case)
+        case.compile()
+
+        # Draft variables in jouw model
+        Finj_var   = case.get_object_by_name("Finj", "slider")
+        d_gain_var = case.get_object_by_name("d_gain", "slider")
+        q_gain_var = case.get_object_by_name("q_gain", "slider")
+
+        PB_var  = case.get_object_by_name("PB",  "button")
+        PB1_var = case.get_object_by_name("PB1", "button")
+
+        # Signal handles per PCC
+        sigV = {}
+        sigI = {}
+
+        for pcc in pcc_list:
+            sigV[f"{pcc['name']}_Vd"] = case.get_signal(pcc["Vd_path"])
+            sigV[f"{pcc['name']}_Vq"] = case.get_signal(pcc["Vq_path"])
+            sigI[f"{pcc['name']}_Id"] = case.get_signal(pcc["Id_path"])
+            sigI[f"{pcc['name']}_Iq"] = case.get_signal(pcc["Iq_path"])
+
+        for f in inject_freqs:
+            print("\n====================================")
+            print(f"Injectiefrequentie: f = {f:.2f} Hz")
+            print("====================================")
+
+            # phasors per run: mode 0 = d-run, mode 1 = q-run
+            Vd_ph_modes = np.zeros((2, num_pcc), dtype=complex)
+            Vq_ph_modes = np.zeros((2, num_pcc), dtype=complex)
+            Id_ph_modes = np.zeros((2, num_pcc), dtype=complex)
+            Iq_ph_modes = np.zeros((2, num_pcc), dtype=complex)
+
+            for mode_idx, (gd, gq) in enumerate([(A_inj, 0.0), (0.0, A_inj)]):
+                mode_name = "D-RUN" if mode_idx == 0 else "Q-RUN"
+                print(f"  --> Run {mode_idx+1}: {mode_name} (d_gain={gd}, q_gain={gq})")
+
+                # STOP -> sliders zetten
+                safe_stop(case)
+                Finj_var.value   = float(f)
+                d_gain_var.value = float(gd)
+                q_gain_var.value = float(gq)
+
+                # reset pulse (sync ramps)
+                pulse_reset_buttons(PB_var, PB1_var, pulse_s=0.05)
+
+                # RUN
+                case.run()
+                time.sleep(SETTLE_S)
+
+                # buffers refresh
+                case.update_plots()
+                time.sleep(0.3)
+                case.update_plots()
+
+                # read time series
+                sig_handles = {}
+                sig_handles.update(sigV)
+                sig_handles.update(sigI)
+
+                t, data = get_timeseries_consistent(case, sig_handles, timeout_s=TIMEOUT_S, min_samples=MIN_SAMPLES)
+
+                # phasors per PCC
+                for p_idx, pcc in enumerate(pcc_list):
+                    keyVd = f"{pcc['name']}_Vd"
+                    keyVq = f"{pcc['name']}_Vq"
+                    keyId = f"{pcc['name']}_Id"
+                    keyIq = f"{pcc['name']}_Iq"
+
+                    Vd_ph = lockin_phasor(data[keyVd], t, f)
+                    Vq_ph = lockin_phasor(data[keyVq], t, f)
+                    Id_ph = lockin_phasor(data[keyId], t, f)
+                    Iq_ph = lockin_phasor(data[keyIq], t, f)
+
+                    Vd_ph_modes[mode_idx, p_idx] = Vd_ph
+                    Vq_ph_modes[mode_idx, p_idx] = Vq_ph
+                    Id_ph_modes[mode_idx, p_idx] = Id_ph
+                    Iq_ph_modes[mode_idx, p_idx] = Iq_ph
+
+            # STOP en injectie uit (na beide runs)
+            safe_stop(case)
+            d_gain_var.value = 0.0
+            q_gain_var.value = 0.0
+
+            # ----------------------------
+            # Y_conv opbouwen (block-diagonal per PCC)
+            # ----------------------------
+            Y_big = np.zeros((size, size), dtype=complex)
+
+            for p_idx, pcc in enumerate(pcc_list):
+                row0 = 2 * p_idx
+                row1 = row0 + 1
+
+                # run 1 (d-run)
+                Vd_d = Vd_ph_modes[0, p_idx]
+                Vq_d = Vq_ph_modes[0, p_idx]
+                Id_d = Id_ph_modes[0, p_idx]
+                Iq_d = Iq_ph_modes[0, p_idx]
+
+                # run 2 (q-run)
+                Vd_q = Vd_ph_modes[1, p_idx]
+                Vq_q = Vq_ph_modes[1, p_idx]
+                Id_q = Id_ph_modes[1, p_idx]
+                Iq_q = Iq_ph_modes[1, p_idx]
+
+                V_exc = np.array([[Vd_d, Vd_q],
+                                  [Vq_d, Vq_q]], dtype=complex)
+
+                I_meas = np.array([[Id_d, Id_q],
+                                   [Iq_d, Iq_q]], dtype=complex)
+
+                detV = np.linalg.det(V_exc)
+                condV = np.linalg.cond(V_exc)
+
+                print(f"\n[{pcc['name']}] det(V_exc)={detV:+.3e}, cond(V_exc)={condV:.3e}")
+
+                if abs(detV) < DET_THR or condV > COND_THR:
+                    print(f"  [WARN] V_exc slecht conditioneerd bij f={f} Hz, {pcc['name']} -> skip Y_2x2 op deze f")
+                    continue
+
+                Y_2x2 = I_meas @ np.linalg.inv(V_exc)
+                Y_big[row0:row1+1, row0:row1+1] = Y_2x2
+
+            Y_results[f] = Y_big
+            print("\nY_conv(jw) admittance-matrix:")
+            print(Y_big)
+
+            # ----------------------------
+            # Z_grid opstellen (block-diagonal)
+            # ----------------------------
+            Z_grid = build_Zgrid_blockdiag(num_pcc, f, R_g, L_g, omega0)
+            Zgrid_results[f] = Z_grid
+            print("\nZ_grid(jw) impedantie-matrix:")
+            print(Z_grid)
+
+            # ----------------------------
+            # L(jw) en eigenwaarden
+            # ----------------------------
+            L = Y_big @ Z_grid  # eventueel L = -Y_big @ Z_grid afhankelijk tekenconventie
+            L_results[f] = L
+            eigvals = np.linalg.eigvals(L)
+            eig_results[f] = eigvals
+
+            print("\nLusversterking L(jw):")
+            print(L)
+            print("Eigenwaarden λ(L):", eigvals)
+
+    finally:
+        safe_stop(case)
+        try:
+            case.close()
+        except Exception:
+            pass
+
+# --------------------------------------------------
+# 5. GNC / Nyquist via eigenwaarden van L(jw)
+# --------------------------------------------------
+freqs = sorted(eig_results.keys())
+if len(freqs) == 0:
+    raise RuntimeError("Geen resultaten in eig_results. Check je meet/injectie stap.")
+
+# Branch tracking
+lam_branches = track_eig_branches(eig_results, freqs)
+
+# ---- Nyquist plot eigenloci (full scale) ----
+plt.figure()
+for i, lam in enumerate(lam_branches):
+    plt.plot(lam.real, lam.imag, "-o", label=f"λ{i+1}(jω)")
+plt.axhline(0, color="gray", linewidth=0.5)
+plt.axvline(0, color="gray", linewidth=0.5)
+plt.scatter([-1], [0], color="red", zorder=5)
+plt.xlabel("Re{λ(jω)}")
+plt.ylabel("Im{λ(jω)}")
+plt.title("GNC via eigenwaarden van L(jω) (full scale)")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---- Zoom rond -1 ----
+plt.figure()
+for i, lam in enumerate(lam_branches):
+    plt.plot(lam.real, lam.imag, "-o", label=f"λ{i+1}(jω)")
+plt.scatter([-1], [0], color="red", zorder=5)
+plt.xlim(ZOOM_XLIM)
+plt.ylim(ZOOM_YLIM)
+plt.axhline(0, color="gray", linewidth=0.5)
+plt.axvline(0, color="gray", linewidth=0.5)
+plt.xlabel("Re{λ(jω)}")
+plt.ylabel("Im{λ(jω)}")
+plt.title("GNC eigenloci (zoom rond -1)")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---- Encirclements van -1 tellen ----
+print("\n====================================")
+print("GNC-analyse via eigenwaarden λ(L(jω))")
+print("====================================")
+
+N_total = 0
+for i, lam in enumerate(lam_branches):
+    # encirclement count via argument change of (λ + 1)
+    phi = np.unwrap(np.angle(lam + 1.0))
+    dphi = float(phi[-1] - phi[0])
+    N_i = int(np.round(dphi / (2.0 * np.pi)))
+    N_total += N_i
+    print(f"Eigenwaarde {i+1}: totaal argumentverschil ≈ {dphi:.6f} rad -> N_i ≈ {N_i}")
+
+P = 0  # aangenomen: geen RHP-polen in open lus
+Z = N_total + P
+
+print(f"\nSom van omkruisingen N = {N_total}, aangenomen P = {P} -> Z = {Z}")
+if Z == 0:
+    print("Conclusie: gesloten-lus STABIEL (geen RHP-modi).")
+else:
+    print("Conclusie: gesloten-lus INSTABIEL (Z != 0, RHP-modi aanwezig).")
+
