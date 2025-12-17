@@ -1,0 +1,359 @@
+# -*- coding: utf-8 -*-
+"""
+Impedantie-extractie + GNC via eigenwaarden van L(jw)
+ROUTE A (RSCAD plotbuffer time-series via get_signal) + 2-run SIN/COS
+
+- Multi-PCC scalable: 1 PCC -> 2x2, 2 PCC -> 4x4, 3 PCC -> 6x6 (block-diagonal per PCC)
+- Z_grid dq-model: [[R+sL, -w0 L],[+w0 L, R+sL]]
+- Frequency sweep: 5, 10, 21, 40, 60 Hz
+- Meet per PCC: Vd, Vq en (SIN-run) Id/Iq, (COS-run) Id1/Iq1
+- Bouw Y_conv(jw), Z_grid(jw), L(jw)=Y*Z, eigenvalues, Nyquist eigenloci + encirclement count
+
+BELANGRIJK:
+1) Runtime -> Monitoring -> Plots -> Window Size >= 1.0 s (jij hebt 1.0 s gezet).
+2) Draft sliders (Finj/gainsin/gaincos) mogen alleen gezet worden wanneer case NIET draait:
+   STOP -> set sliders -> RUN -> update_plots/read -> STOP -> next.
+"""
+
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import rtds.rscadfx
+
+# --------------------------------------------------
+# 0. Basisinstellingen
+# --------------------------------------------------
+casefile = r"C:\Users\muass\OneDrive\Documenten\RSCAD\RTDS_USER_FX\fileman\CH1-VoltageDivider\vdiv.rtfx"
+
+inject_freqs = [5.0, 10.0, 21.0, 40.0, 60.0]
+
+inj_gain = 0.05          # basisinjectie amplitude
+SETTLE_S = 1.0           # settle na run
+TIMEOUT_S = 20.0         # timeout om buffers te krijgen
+DET_THR = 1e-12          # invertibility check
+
+# Grid params (zoals in jouw voorbeeldcode)
+R_g = 0.1468
+L_g = 1.46
+omega0 = 2.0 * np.pi * 60.0
+
+# --------------------------------------------------
+# 1. Hulpfuncties: phasor uit tijdserie via FFT
+# --------------------------------------------------
+def phasor_fft(x, dt, f_inj):
+    """
+    FFT van tijdsignaal x(t) met Hann-window (AC-only).
+    Geeft complex phasor op de injectiefrequentie f_inj en de bijbehorende FFT-bin.
+    """
+    x = np.asarray(x)
+    x_ac = x - np.mean(x)
+    Nloc = len(x_ac)
+    if Nloc < 4:
+        raise RuntimeError("Te weinig samples voor FFT.")
+
+    w = np.hanning(Nloc)
+    X = np.fft.rfft(x_ac * w)
+    freqs = np.fft.rfftfreq(Nloc, d=dt)
+    k = int(np.argmin(np.abs(freqs - f_inj)))
+    return X[k], float(freqs[k])
+
+def get_timeseries_consistent(case, sig_handles, timeout_s=20.0):
+    """
+    Leest consistente time-series voor alle signals in sig_handles:
+    sig_handles: dict name -> signal_handle (case.get_signal(path))
+    Return: t (numpy), data dict name->x
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        case.update_plots()
+        time.sleep(0.15)
+
+        t_ref = None
+        data = {}
+        ok = True
+
+        for name, sig in sig_handles.items():
+            tt = np.asarray(sig.get_time_data())
+            xx = np.asarray(sig.get_data())
+
+            if len(tt) < 2 or len(xx) != len(tt):
+                ok = False
+                break
+
+            if t_ref is None:
+                t_ref = tt
+            else:
+                if len(tt) != len(t_ref):
+                    ok = False
+                    break
+
+            data[name] = xx
+
+        if ok:
+            return t_ref, data
+
+    raise RuntimeError("Kon geen consistente time series ophalen (timeout).")
+
+def build_Zgrid_blockdiag(num_pcc, f, R_g, L_g, omega0):
+    """
+    Z_grid(jw) block-diagonal met dq-coupling per PCC:
+    Zdq = [[R+sL, -w0 L],[+w0 L, R+sL]]
+    """
+    size = 2 * num_pcc
+    s = 1j * 2.0 * np.pi * f
+    Zdd = R_g + s * L_g
+    Zdq = -omega0 * L_g
+    Zqd =  omega0 * L_g
+
+    Z_2x2 = np.array([[Zdd, Zdq],
+                      [Zqd, Zdd]], dtype=complex)
+
+    Z = np.zeros((size, size), dtype=complex)
+    for p in range(num_pcc):
+        i0 = 2 * p
+        Z[i0:i0+2, i0:i0+2] = Z_2x2
+    return Z
+
+def sort_eigs_stable(eigvals):
+    # simpele consistente sortering; later kun je matchen op minimale afstand
+    return np.array(sorted(eigvals, key=lambda z: (z.real, z.imag)))
+
+# --------------------------------------------------
+# 2. PCC configuratie (scalable)
+# --------------------------------------------------
+# Voeg PCC2/PCC3 toe door extra dicts te plakken met hun eigen signal paths.
+# SIN-run gebruikt Id_sin/Iq_sin; COS-run gebruikt Id_cos/Iq_cos (= Id1/Iq1 bij jou).
+
+pcc_list = [
+    {
+        "name": "PCC1",
+        "Vd_path":     "Subsystem #1|CTLs|Vars|Vdpu11",
+        "Vq_path":     "Subsystem #1|CTLs|Vars|Vqpu11",
+        "Id_sin_path": "Subsystem #1|CTLs|Vars|Id",
+        "Iq_sin_path": "Subsystem #1|CTLs|Vars|Iq",
+        "Id_cos_path": "Subsystem #1|CTLs|Vars|Id1",
+        "Iq_cos_path": "Subsystem #1|CTLs|Vars|Iq1",
+    },
+    # {
+    #     "name": "PCC2",
+    #     "Vd_path":     "Subsystem #1|CTLs|Vars|Vdpu22",
+    #     "Vq_path":     "Subsystem #1|CTLs|Vars|Vqpu22",
+    #     "Id_sin_path": "Subsystem #1|CTLs|Vars|Id2",
+    #     "Iq_sin_path": "Subsystem #1|CTLs|Vars|Iq2",
+    #     "Id_cos_path": "Subsystem #1|CTLs|Vars|Id3",
+    #     "Iq_cos_path": "Subsystem #1|CTLs|Vars|Iq3",
+    # },
+]
+
+num_pcc = len(pcc_list)
+size = 2 * num_pcc
+
+# --------------------------------------------------
+# 3. Result containers
+# --------------------------------------------------
+Y_results = {}
+Zgrid_results = {}
+eig_results = {}
+
+# --------------------------------------------------
+# 4. RSCAD verbinding + sweep
+# --------------------------------------------------
+with rtds.rscadfx.remote_connection() as app:
+    case = app.open_case(casefile)
+    case.stop()
+    case.compile()
+
+    # sliders / draft-variables (alleen zetten wanneer case STOP)
+    Finj_var    = case.get_object_by_name("Finj", "slider")
+    gainsin_var = case.get_object_by_name("gainsin", "slider")
+    gaincos_var = case.get_object_by_name("gaincos", "slider")
+
+    # Signal handles (Vd/Vq altijd; Id/Iq per run kiezen we door verschillende handles te vragen)
+    sigV = {}
+    sigI_sin = {}
+    sigI_cos = {}
+
+    for pcc in pcc_list:
+        sigV[f"{pcc['name']}_Vd"] = case.get_signal(pcc["Vd_path"])
+        sigV[f"{pcc['name']}_Vq"] = case.get_signal(pcc["Vq_path"])
+
+        sigI_sin[f"{pcc['name']}_Id"] = case.get_signal(pcc["Id_sin_path"])
+        sigI_sin[f"{pcc['name']}_Iq"] = case.get_signal(pcc["Iq_sin_path"])
+
+        sigI_cos[f"{pcc['name']}_Id"] = case.get_signal(pcc["Id_cos_path"])
+        sigI_cos[f"{pcc['name']}_Iq"] = case.get_signal(pcc["Iq_cos_path"])
+
+    for f in inject_freqs:
+        print("\n====================================")
+        print(f"Injectiefrequentie: f = {f:.2f} Hz")
+        print("====================================")
+
+        # opslag per mode (0=SIN, 1=COS)
+        Vd_ph_modes = np.zeros((2, num_pcc), dtype=complex)
+        Vq_ph_modes = np.zeros((2, num_pcc), dtype=complex)
+        Id_ph_modes = np.zeros((2, num_pcc), dtype=complex)
+        Iq_ph_modes = np.zeros((2, num_pcc), dtype=complex)
+
+        for mode_idx, (gain_sin, gain_cos) in enumerate([(inj_gain, 0.0), (0.0, inj_gain)]):
+            mode_name = "SIN" if mode_idx == 0 else "COS"
+            print(f"  --> Run {mode_idx+1}: {mode_name} actief (gainsin={gain_sin}, gaincos={gain_cos})")
+
+            # STOP -> sliders zetten
+            case.stop()
+            Finj_var.value = float(f)
+            gainsin_var.value = float(gain_sin)
+            gaincos_var.value = float(gain_cos)
+
+            # RUN
+            case.run()
+            time.sleep(SETTLE_S)
+
+            # kies juiste I-signals voor deze run
+            sig_handles = {}
+            sig_handles.update(sigV)
+            if mode_idx == 0:
+                sig_handles.update(sigI_sin)
+            else:
+                sig_handles.update(sigI_cos)
+
+            # read time series
+            t, data = get_timeseries_consistent(case, sig_handles, timeout_s=TIMEOUT_S)
+            dt = float(t[1] - t[0])
+
+            # phasors per PCC
+            for p_idx, pcc in enumerate(pcc_list):
+                keyVd = f"{pcc['name']}_Vd"
+                keyVq = f"{pcc['name']}_Vq"
+                keyId = f"{pcc['name']}_Id"
+                keyIq = f"{pcc['name']}_Iq"
+
+                Vd_ph, fbinVd = phasor_fft(data[keyVd], dt, f)
+                Vq_ph, fbinVq = phasor_fft(data[keyVq], dt, f)
+                Id_ph, fbinId = phasor_fft(data[keyId], dt, f)
+                Iq_ph, fbinIq = phasor_fft(data[keyIq], dt, f)
+
+                if abs(fbinVd - f) > 1e-6:
+                    print(f"     [WARN] {pcc['name']} bin={fbinVd:.6f}Hz (requested {f:.6f}Hz)")
+
+                Vd_ph_modes[mode_idx, p_idx] = Vd_ph
+                Vq_ph_modes[mode_idx, p_idx] = Vq_ph
+                Id_ph_modes[mode_idx, p_idx] = Id_ph
+                Iq_ph_modes[mode_idx, p_idx] = Iq_ph
+
+        # STOP en injectie uit (na beide runs)
+        case.stop()
+        gainsin_var.value = 0.0
+        gaincos_var.value = 0.0
+
+        # ----------------------------
+        # Y_conv opbouwen (block-diagonal per PCC)
+        # ----------------------------
+        Y_big = np.zeros((size, size), dtype=complex)
+
+        for p_idx, pcc in enumerate(pcc_list):
+            row0 = 2 * p_idx
+            row1 = row0 + 1
+
+            Vd1_ph = Vd_ph_modes[0, p_idx]
+            Vq1_ph = Vq_ph_modes[0, p_idx]
+            Id1_ph = Id_ph_modes[0, p_idx]
+            Iq1_ph = Iq_ph_modes[0, p_idx]
+
+            Vd2_ph = Vd_ph_modes[1, p_idx]
+            Vq2_ph = Vq_ph_modes[1, p_idx]
+            Id2_ph = Id_ph_modes[1, p_idx]
+            Iq2_ph = Iq_ph_modes[1, p_idx]
+
+            V_exc = np.array([[Vd1_ph, Vd2_ph],
+                              [Vq1_ph, Vq2_ph]], dtype=complex)
+
+            I_meas = np.array([[Id1_ph, Id2_ph],
+                               [Iq1_ph, Iq2_ph]], dtype=complex)
+
+            if abs(np.linalg.det(V_exc)) < DET_THR:
+                print(f"Waarschuwing: V_exc slecht conditioneerd bij f={f} Hz, {pcc['name']}")
+                continue
+
+            Y_2x2 = I_meas @ np.linalg.inv(V_exc)
+            Y_big[row0:row1+1, row0:row1+1] = Y_2x2
+
+        Y_results[f] = Y_big
+        print("\nY_conv(jw) admittance-matrix:")
+        print(Y_big)
+
+        # ----------------------------
+        # Z_grid opstellen (block-diagonal)
+        # ----------------------------
+        Z_grid = build_Zgrid_blockdiag(num_pcc, f, R_g, L_g, omega0)
+        Zgrid_results[f] = Z_grid
+        print("\nZ_grid(jw) impedantie-matrix:")
+        print(Z_grid)
+
+        # ----------------------------
+        # L(jw) en eigenwaarden
+        # ----------------------------
+        L = Y_big @ Z_grid  # eventueel L = -Y_big @ Z_grid afhankelijk tekenconventie
+        eigvals = np.linalg.eigvals(L)
+        eig_results[f] = eigvals
+
+        print("\nLusversterking L(jw):")
+        print(L)
+        print("Eigenwaarden λ(L):", eigvals)
+
+    case.close()
+
+# --------------------------------------------------
+# 5. GNC / Nyquist via eigenwaarden van L(jw)
+# --------------------------------------------------
+freqs = sorted(eig_results.keys())
+if len(freqs) == 0:
+    raise RuntimeError("Geen resultaten in eig_results. Check je meet/injectie stap.")
+
+nL = len(next(iter(eig_results.values())))
+lam_branches = [np.zeros(len(freqs), dtype=complex) for _ in range(nL)]
+
+for k, f in enumerate(freqs):
+    eigvals_sorted = sort_eigs_stable(eig_results[f])
+    for i in range(nL):
+        lam_branches[i][k] = eigvals_sorted[i]
+
+# ---- Nyquist plot eigenloci ----
+plt.figure()
+for i, lam in enumerate(lam_branches):
+    plt.plot(lam.real, lam.imag, "-o", label=f"λ{i+1}(jω)")
+    for k, ff in enumerate(freqs):
+        plt.text(lam.real[k], lam.imag[k], f"{int(ff)}Hz", fontsize=8)
+
+plt.axhline(0, color="gray", linewidth=0.5)
+plt.axvline(0, color="gray", linewidth=0.5)
+plt.scatter([-1], [0], color="red", zorder=5)
+plt.xlabel("Re{λ(jω)}")
+plt.ylabel("Im{λ(jω)}")
+plt.title("GNC via eigenwaarden van L(jω)")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---- Encirclements van -1 tellen ----
+print("\n====================================")
+print("GNC-analyse via eigenwaarden λ(L(jω))")
+print("====================================")
+
+N_total = 0
+for i, lam in enumerate(lam_branches):
+    phi = np.unwrap(np.angle(lam + 1.0))
+    dphi = float(phi[-1] - phi[0])
+    N_i = int(np.round(dphi / (2.0 * np.pi)))
+    N_total += N_i
+    print(f"Eigenwaarde {i+1}: totaal argumentverschil ≈ {dphi:.6f} rad -> N_i ≈ {N_i}")
+
+P = 0  # aangenomen: geen RHP-polen in open lus
+Z = N_total + P
+
+print(f"\nSom van omkruisingen N = {N_total}, aangenomen P = {P} -> Z = {Z}")
+if Z == 0:
+    print("Conclusie: gesloten-lus STABIEL (geen RHP-modi).")
+else:
+    print("Conclusie: gesloten-lus INSTABIEL (Z != 0, RHP-modi aanwezig).")
+
