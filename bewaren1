@@ -1,0 +1,232 @@
+# -*- coding: utf-8 -*-
+"""
+DQ-injectie test (2-run d/q) + lock-in phasor extractie (RSCAD FX plotbuffers)
+
+Doel:
+- Alleen testen dat je per frequentie 2 runs (d en q) correcte phasors krijgt:
+  Vdpu11, Vqpu11, Id, Iq.
+- Stuurt jouw draft variables aan:
+  sliders:  Finj, d_gain, q_gain
+  buttons:  PB, PB1   (reset pulse via .position)
+
+BELANGRIJK:
+- Buttons worden NIET met .value gezet. Gebruik .position = 1/0.
+- Sliders alleen zetten wanneer case STOP is (jij had dat al).
+- Runtime -> Monitoring -> Plots -> Window Size >= 1.0 s (of groter bij lage f).
+
+Auteur: (jij)
+"""
+
+import time
+import numpy as np
+import rtds.rscadfx
+
+# --------------------------------------------------
+# 0) Basisinstellingen
+# --------------------------------------------------
+casefile = r"C:\Users\muass\OneDrive\Documenten\RSCAD\RTDS_USER_FX\fileman\testcase.rtfx"
+
+inject_freqs = list(range(5, 21, 1))  # test sweep (5..20 Hz)
+A_inj = 0.05                          # amplitude (pu/whatever jouw model gebruikt)
+
+SETTLE_S    = 1.0     # wachten na RUN voordat je meet
+TIMEOUT_S   = 25.0    # timeout plotbuffers
+MIN_SAMPLES = 1000    # minimum samples in buffer
+
+# Signal paths (zoals je oude code)
+SIGPATHS = {
+    "Vd": "Subsystem #1|CTLs|Vars|Vdpu11",
+    "Vq": "Subsystem #1|CTLs|Vars|Vqpu11",
+    "Id": "Subsystem #1|CTLs|Vars|Id",
+    "Iq": "Subsystem #1|CTLs|Vars|Iq",
+}
+
+# --------------------------------------------------
+# 1) Helpers
+# --------------------------------------------------
+def get_timeseries_consistent(case, sig_handles, timeout_s=30.0, min_samples=1000):
+    """
+    Wacht tot RSCAD FX plotbuffers gevuld zijn en consistente time series opleveren.
+    """
+    t_start = time.time()
+    last_len = -1
+    stable_count = 0
+
+    while time.time() - t_start < timeout_s:
+        case.update_plots()
+        time.sleep(0.2)
+
+        t_ref = None
+        data = {}
+        ok = True
+
+        for name, sig in sig_handles.items():
+            tt = np.asarray(sig.get_time_data())
+            xx = np.asarray(sig.get_data())
+
+            if len(tt) < min_samples or len(tt) != len(xx):
+                ok = False
+                break
+
+            if t_ref is None:
+                t_ref = tt
+            elif len(tt) != len(t_ref):
+                ok = False
+                break
+
+            data[name] = xx
+
+        if ok:
+            if len(t_ref) == last_len:
+                stable_count += 1
+            else:
+                stable_count = 0
+                last_len = len(t_ref)
+
+            if stable_count >= 2:
+                return t_ref, data
+
+    raise RuntimeError(
+        "Kon geen consistente time series ophalen (timeout). "
+        "Check: case RUNNING, plots bevatten signals, window size, update_plots."
+    )
+
+def lockin_phasor(x, t, f_inj, remove_dc=True, window=True):
+    """
+    Lock-in / correlatie phasor op exact f_inj:
+      X = (2/N) * sum( x[n] * exp(-j 2pi f t[n]) )
+
+    Tip: voor FRF ratios maakt absolute scaling minder uit; dit is vooral robuust tegen bin-mismatch.
+    """
+    x = np.asarray(x, dtype=float)
+    t = np.asarray(t, dtype=float)
+
+    if remove_dc:
+        x = x - np.mean(x)
+
+    if window:
+        w = np.hanning(len(x))
+        x = x * w
+
+    ref = np.exp(-1j * 2.0 * np.pi * f_inj * t)
+    X = (2.0 / len(x)) * np.sum(x * ref)
+    return X
+
+def pulse_reset_buttons(pb, pb1, pulse_s=0.05):
+    """
+    Pulse twee RSCAD buttons via .position (zoals jouw voorbeeldcode):
+      position = 1 -> 0
+
+    Let op: dit is een "click event". Werkt alleen met objecttype "button".
+    """
+    pb.position = 1
+    pb1.position = 1
+    time.sleep(pulse_s)
+    pb.position = 0
+    pb1.position = 0
+
+def safe_stop(case):
+    try:
+        case.stop()
+    except Exception:
+        pass
+
+# --------------------------------------------------
+# 2) Main: verbinding + 2-run per frequentie
+# --------------------------------------------------
+results = {}  # results[f]["d"|"q"] = dict of complex phasors
+
+with rtds.rscadfx.remote_connection() as app:
+    case = app.open_case(casefile)
+    try:
+        safe_stop(case)
+        case.compile()
+
+        # Draft variables (namen zoals op jouw screenshots)
+        Finj_var   = case.get_object_by_name("Finj", "slider")
+        d_gain_var = case.get_object_by_name("d_gain", "slider")
+        q_gain_var = case.get_object_by_name("q_gain", "slider")
+
+        PB_var  = case.get_object_by_name("PB",  "button")
+        PB1_var = case.get_object_by_name("PB1", "button")
+
+        # Signal handles
+        sig = {name: case.get_signal(path) for name, path in SIGPATHS.items()}
+
+        for f in inject_freqs:
+            print("\n====================================")
+            print(f"f_inj = {f:.2f} Hz")
+            print("====================================")
+
+            results[f] = {}
+
+            # --------------------------
+            # RUN 1: d-injectie
+            # --------------------------
+            safe_stop(case)
+            Finj_var.value   = float(f)
+            d_gain_var.value = float(A_inj)
+            q_gain_var.value = 0.0
+
+            # reset pulse (fase-synch)
+            pulse_reset_buttons(PB_var, PB1_var, pulse_s=0.05)
+
+            case.run()
+            time.sleep(SETTLE_S)
+
+            t, data = get_timeseries_consistent(case, sig, timeout_s=TIMEOUT_S, min_samples=MIN_SAMPLES)
+
+            ph_d = {
+                "Vd": lockin_phasor(data["Vd"], t, f),
+                "Vq": lockin_phasor(data["Vq"], t, f),
+                "Id": lockin_phasor(data["Id"], t, f),
+                "Iq": lockin_phasor(data["Iq"], t, f),
+            }
+            results[f]["d"] = ph_d
+
+            print("Run d (d_gain=A, q_gain=0)")
+            for k, v in ph_d.items():
+                print(f"  {k}: {v.real:+.6e} {v.imag:+.6e}j")
+
+            # --------------------------
+            # RUN 2: q-injectie
+            # --------------------------
+            safe_stop(case)
+            Finj_var.value   = float(f)
+            d_gain_var.value = 0.0
+            q_gain_var.value = float(A_inj)
+
+            # reset pulse (weer synch voor deze run)
+            pulse_reset_buttons(PB_var, PB1_var, pulse_s=0.05)
+
+            case.run()
+            time.sleep(SETTLE_S)
+
+            t, data = get_timeseries_consistent(case, sig, timeout_s=TIMEOUT_S, min_samples=MIN_SAMPLES)
+
+            ph_q = {
+                "Vd": lockin_phasor(data["Vd"], t, f),
+                "Vq": lockin_phasor(data["Vq"], t, f),
+                "Id": lockin_phasor(data["Id"], t, f),
+                "Iq": lockin_phasor(data["Iq"], t, f),
+            }
+            results[f]["q"] = ph_q
+
+            print("Run q (d_gain=0, q_gain=A)")
+            for k, v in ph_q.items():
+                print(f"  {k}: {v.real:+.6e} {v.imag:+.6e}j")
+
+            # injectie uit tussen frequenties
+            safe_stop(case)
+            d_gain_var.value = 0.0
+            q_gain_var.value = 0.0
+
+        print("\nKlaar. results dict bevat per frequentie lock-in phasors voor d- en q-run.")
+
+    finally:
+        # Zorg dat je case netjes stopt/sluit, ook bij errors
+        safe_stop(case)
+        try:
+            case.close()
+        except Exception:
+            pass
